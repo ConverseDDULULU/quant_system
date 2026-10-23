@@ -22,3 +22,8 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Node dependencies everywhere
+node_modules/
+**/node_modules/
+package-lock.json

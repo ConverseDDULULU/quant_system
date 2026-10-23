@@ -13,7 +13,7 @@ secrets/
 account_info.json
 cert/
 
-# 3. 파이썬 가상환경 및 캐시 (용량 낭비 방지)
+# 3. 파이썬 가상환경 및 캐시
 venv/
 .venv/
 env/
@@ -22,7 +22,7 @@ __pycache__/
 *$py.class
 .pytest_cache/
 
-# 4. 퀀트 데이터 원장 및 백테스트 캐시 (수백 MB~수 GB 대용량)
+# 4. 퀀트 데이터 원장 및 백테스트 캐시
 data/
 *.parquet
 *.csv
@@ -40,6 +40,10 @@ logs/
 .DS_Store
 Thumbs.db
 
-# 7. 프론트엔드 의존성 및 빌드 아티팩트
-frontend/node_modules/
-frontend/dist/
+# 7. Node / 프론트엔드 의존성 및 빌드 파일 (어디에 있든 전체 제외)
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+package-lock.json
+**/package-lock.json
