@@ -16,7 +16,7 @@ load_dotenv("config/.env")
 
 
 class AIReporter:
-    def __init__(self):
+    def __init__(self): 
         self.api_key = ensure_gemini_api_key()
         self.client = None
 
@@ -39,10 +39,10 @@ class AIReporter:
 
         if not self.client:
             return (
-                f"📊 [시스템 알림 | {ticker}]\n"
-                f"- 현재가: ${price} (RSI {rsi}, 저점반등 +{rebound}%)\n"
-                f"- 체결 지연: {latency}ms (초저지연 충족)\n"
-                f"- 멘탈 가이드: 원칙 기반 분할 진입 타깃입니다. 동결 자산(SOXL 등) 물타기 엄금."
+                f"📊 **[퀀트 시스템 가이드 | {ticker}]**\n"
+                f"• 체결 단가: ${price} (RSI {rsi}, 저점 대비 +{rebound}%)\n"
+                f"• 알고리즘 지연: {latency}ms (초저지연 충족)\n"
+                f"• 리스크 관리: 과매도 반등 국면 기계적 분할 진입. 동결 자산(레버리지 등) 뇌동매매 엄금."
             )
 
         prompt = f"""
@@ -60,7 +60,7 @@ class AIReporter:
 3. 말투는 군더더기 없고 단호한 시니어 퀀트 톤으로 작성.
 """
 
-        candidate_models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-flash", "gemini-3.8-flash"]
+        candidate_models = ["gemini-2.0-flash", "gemini-1.5-flash"]
 
         for model_name in candidate_models:
             try:
@@ -69,18 +69,23 @@ class AIReporter:
                     model=model_name,
                     contents=prompt,
                 )
-                return response.text.strip()
+                if response and response.text:
+                    return response.text.strip()
             except Exception as e:
                 err_str = str(e)
+                # 503 과부하, 404 모델 없음 시 다음 모델 시도
                 if "503" in err_str or "404" in err_str:
                     continue
-                return f"[AI ERROR] 브리핑 생성 실패 ({e})\n기계적 시그널: {ticker} @ ${price}"
+                # 429 Quota 초과 시 곧바로 정갈한 정량 fallback으로 즉시 탈출
+                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    break
 
-        # 모든 모델 실패 시 빠른 fallback
+        # 모든 모델 실패 또는 Quota 한도 도달 시 깔끔한 마크다운 대체 가이드
         return (
-            f"📊 [시스템 비상 알림 | {ticker}]\n"
-            f"- 현재가: ${price} (RSI {rsi}, 반등 +{rebound}%)\n"
-            f"- AI 서버 혼잡으로 기계적 신호로 대체 발송합니다. 원칙 분할 매수를 유지하세요."
+            f"⚡ **[퀀트 신호 리스크 가이드 | {ticker}]**\n"
+            f"• **체결 단가**: ${price} (일봉 RSI {rsi} 과매도 / 반등 +{rebound}%)\n"
+            f"• **운용 원칙**: 1차 분할 매수 구간이며, 손절 라인은 직전 저점 이탈 시 기계적 집행.\n"
+            f"• **멘탈 제어**: AI 일시 한도와 무관하게 뇌동매매 및 레버리지 추격을 금지합니다."
         )
 
     async def send_telegram_alert(self, message: str) -> None:

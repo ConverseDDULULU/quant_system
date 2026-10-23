@@ -1,6 +1,6 @@
 """
 Module: main_pipeline.py
-Purpose: Level 2(초저지연 트리거) + Level 3(비동기 AI 리포터) 통합 런타임
+Purpose: Level 2(초저지연 트리거) + Level 3(비동기 AI 리포터) + WebSocket 대시보드 송출
 Architecture: Core Real-time Engine
 """
 
@@ -9,10 +9,12 @@ import sys
 import json
 import time
 import asyncio
+from datetime import datetime
 from collections import deque
 import numpy as np
 
 from level3_ai.ai_reporter import AIReporter
+from api.server import manager  # 웹소켓 브로드캐스트 매니저 임포트
 
 
 class IntegratedQuantRunner:
@@ -24,14 +26,11 @@ class IntegratedQuantRunner:
         # [원칙 리스크 가드] 동결 자산 필터링
         self.frozen_tickers = {"SOXL", "TQQQ", "OKLO", "NLR"}
         
-        # 신호 중복 발송 방지용 쿨다운 타이머
+        # 중복 발송 방지용 쿨다운
         self.signal_cooldown = {}
         self.COOLDOWN_SECONDS = 60
-        
-        # 백그라운드 AI 태스크 목록 추적
         self.background_tasks = set()
         
-        # Level 3 AI 브리퍼
         self.ai_reporter = AIReporter()
         self.load_watchlist()
 
@@ -89,20 +88,32 @@ class IntegratedQuantRunner:
 
     async def _dispatch_ai_worker(self, signal: dict):
         briefing = await self.ai_reporter.generate_signal_briefing(signal)
+        
+        # 1. 터미널 로깅 및 텔레그램 발송
         await self.ai_reporter.send_telegram_alert(briefing)
+        
+        # 2. 웹 대시보드로 실시간 AI 브리핑 브로드캐스트
+        await manager.broadcast({
+            "type": "AI_BRIEFING",
+            "payload": {
+                "ticker": signal["ticker"],
+                "content": briefing,
+                "timestamp": datetime.now().strftime("%H:%M:%S")
+            }
+        })
 
     async def run_market_loop(self):
         print("[RUNNER] 실시간 통합 파이프라인 가동 시작...\n")
         tickers = list(self.watchlist.keys())
 
-        # 6개 파동 시세 스트림 시뮬레이션
-        for wave in range(1, 7):
-            await asyncio.sleep(0.5)
-            print(f">>> [Stream Wave {wave}] 틱 데이터 도착")
+        # 무한 감시 루프 (테스트를 위해 15초 동안 틱 스트림 지속 발생)
+        for wave in range(1, 20):
+            await asyncio.sleep(1.0)
+            print(f">>> [Stream Wave {wave}] 틱 수신 중...")
 
             for ticker in tickers:
                 base = self.watchlist[ticker]["close"]
-                noise = np.random.uniform(-0.008, 0.016)
+                noise = np.random.uniform(-0.012, 0.018)
                 simulated_price = round(base * (1.0 + noise), 2)
                 now = time.time()
 
@@ -115,16 +126,19 @@ class IntegratedQuantRunner:
                         f"판정지연: {signal['latency_ms']}ms"
                     )
 
-                    # 백그라운드 태스크 등록 및 세트에 보관
+                    # 웹 대시보드로 실시간 체결 로그 브로드캐스트
+                    await manager.broadcast({
+                        "type": "EXECUTION_SIGNAL",
+                        "payload": signal
+                    })
+
+                    # 비동기 AI 브리핑 태스크 발행
                     task = asyncio.create_task(self._dispatch_ai_worker(signal))
                     self.background_tasks.add(task)
                     task.add_done_callback(self.background_tasks.discard)
 
-        # 스트림 종료 후 실행 중인 AI 리포트 태스크 완료 대기
         if self.background_tasks:
-            print("\n[RUNNER] 발행된 백그라운드 AI 브리핑 태스크 완료 대기 중...")
             await asyncio.gather(*list(self.background_tasks), return_exceptions=True)
-            print("[RUNNER] 모든 AI 브리핑 출력 완료.")
 
 
 if __name__ == "__main__":
