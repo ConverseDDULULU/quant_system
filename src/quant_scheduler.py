@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 import warnings
 import pytz
 from market_calendar import market_phase, next_market_open, now_ny, seconds_until_next_open
+from overnight_hold import select_overnight_holds
 from trade_logger import finalize_daily_summary, record_trade
 from trading_safety import (
     MAX_TAKE_PROFIT_PCT,
@@ -37,6 +38,7 @@ INITIAL_BALANCE = None  # 장 시작 시 최초 1회 기록
 DAILY_COMPLETED_TRADES = []  # 오늘 청산된 종목 누적 리스트
 CURRENT_TRADING_DATE = None  # 뉴욕 기준 거래일 (바뀌면 당일 상태 초기화)
 SUMMARY_SENT_DATE = None  # 일일 결산을 이미 보낸 거래일
+HOLD_NOTICE_DATE = None  # 오버나잇 홀딩 판정 알림을 보낸 거래일
 
 warnings.filterwarnings("ignore")
 warnings.simplefilter(action="ignore", category=FutureWarning)
@@ -511,20 +513,60 @@ def is_market_closing_time() -> bool:
         return False
 
 
+def _momentum_continues(client, ticker: str) -> bool:
+    exchange_code = get_exchange_code(client, ticker)
+    analysis = get_bottom_reversal_signal(client, ticker, exchange_code)
+    return bool(analysis and analysis.get("momentum_continues", False))
+
+
 def liquidate_all_positions(client, held_positions: list):
-    """장마감 전 모든 보유 종목 전량 일괄 청산"""
+    """장마감 전 보유 종목 일괄 청산 (스마트 홀딩 조건 충족 종목은 오버나잇 유지)"""
+    global HOLD_NOTICE_DATE
     if not held_positions:
         return
 
     print("\n⏰ ========================================================")
-    print("🚨 [장마감 10분 전] 오버나잇 방지: 전 종목 일괄 청산을 진행합니다.")
+    print("🚨 [장마감 10분 전] 스마트 홀딩 판정 후 나머지 종목을 일괄 청산합니다.")
     print("============================================================")
+
+    positions = []
+    for item in held_positions:
+        ticker = item.get("stk_cd") or item.get("symbol")
+        try:
+            profit_rate = float(str(item.get("pl_rt", "0")).replace(",", "").strip() or "0")
+        except (TypeError, ValueError):
+            profit_rate = 0.0
+        if ticker:
+            positions.append({"ticker": ticker, "profit_rate": profit_rate})
+
+    try:
+        hold_decisions = select_overnight_holds(
+            positions, momentum_fn=lambda t: _momentum_continues(client, t)
+        )
+    except Exception as e:
+        # 판정 오류 시 기존처럼 전량 청산
+        print(f"⚠️ 스마트 홀딩 판정 오류, 전량 청산합니다: {e}")
+        hold_decisions = {}
+
+    trading_date = now_ny().date().isoformat()
+    if hold_decisions and HOLD_NOTICE_DATE != trading_date:
+        lines = [
+            f"• **{t}** {d['profit_rate']:+.2f}% | {d['reason']} | 뉴스: {d['news']}"
+            + (f" ({d['news_reason']})" if d["news_reason"] else "")
+            + f" | 연속 {d['consecutive_days'] + 1}일째"
+            for t, d in hold_decisions.items()
+        ]
+        send_discord_message("🌙 **[오버나잇 홀딩]** 마감 청산 제외 종목\n" + "\n".join(lines))
+        HOLD_NOTICE_DATE = trading_date
 
     accepted_orders = 0
     skipped_orders = 0
 
     for item in held_positions:
         ticker = item.get("stk_cd") or item.get("symbol")
+        if ticker in hold_decisions:
+            print(f"  🌙 [오버나잇 홀딩] {ticker}: {hold_decisions[ticker]['reason']}")
+            continue
         qty = 0
         for key in ("poss_qty", "rmnd_qty", "qty"):
             try:
