@@ -157,6 +157,12 @@ def portfolio_equity_usd(cash_usd: float, holdings: list) -> float:
     return round(total, 2)
 
 
+def account_equity_usd(client, fallback_cash_usd: float, holdings: list) -> float:
+    """계좌 평가액 = 외화예수금(ust21120) + 보유 평가액. 조회 실패 시 주문가능금액으로 대체"""
+    cash = client.get_us_cash_usd() if hasattr(client, "get_us_cash_usd") else None
+    return portfolio_equity_usd(fallback_cash_usd if cash is None else cash, holdings)
+
+
 def kiwoom_minute_rows_to_frame(rows: list) -> pd.DataFrame:
     columns = {
         "open_pric": "Open",

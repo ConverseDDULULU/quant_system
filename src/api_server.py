@@ -36,7 +36,7 @@ from trading_safety import (
     is_momentum_continuing,
     is_take_profit_armed,
     market_trend_allows_entries,
-    portfolio_equity_usd,
+    account_equity_usd,
     record_ticker_sell,
     record_stop_loss,
     reserve_ticker_buy,
@@ -338,8 +338,8 @@ def real_trading_engine():
         if DAILY_START_DATE != today_ny:
             try:
                 opening_holdings = kiwoom.get_us_holdings() if kiwoom else []
-                DAILY_STARTING_EQUITY = portfolio_equity_usd(
-                    usd_direct, opening_holdings
+                DAILY_STARTING_EQUITY = account_equity_usd(
+                    kiwoom, usd_direct, opening_holdings
                 )
             except Exception:
                 DAILY_STARTING_EQUITY = usd_direct

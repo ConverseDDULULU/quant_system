@@ -142,6 +142,32 @@ class KiwoomClient:
             print(f"⚠️ 미국주식 보유종목 조회 실패: {e}")
             return []
 
+    def get_us_cash_usd(self) -> float | None:
+        """통화별 예수금(ust21120)의 USD 외화예수금. 실패 시 None
+
+        ust21110의 fc_ord_alowa(주문가능금액)는 원화대용·미체결 주문에 따라 흔들려
+        계좌 평가액으로 쓰면 일일 수익률이 왜곡된다. 평가액에는 이 값을 쓴다.
+        """
+        self._ensure_token()
+        try:
+            res = requests.post(
+                f"{self.base_url}/api/us/acnt",
+                headers={
+                    "Content-Type": "application/json;charset=UTF-8",
+                    "authorization": f"Bearer {self.access_token}",
+                    "api-id": "ust21120",
+                },
+                json={"cmsn_incl_tp": "0", "exrt_tp": "0"},
+                timeout=10,
+            )
+            data = res.json() if res.status_code == 200 else {}
+            for item in data.get("result_list") or []:
+                if isinstance(item, dict) and item.get("crnc_code") == "USD":
+                    return safe_float(item.get("fx_entr"))
+        except Exception as e:
+            print(f"⚠️ 외화예수금(ust21120) 조회 실패: {e}")
+        return None
+
     def get_us_balance(self) -> dict:
         """해외주식 예수금 조회 (ust21110) + 보유잔고 병합"""
         self._ensure_token()

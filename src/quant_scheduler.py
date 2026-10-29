@@ -28,7 +28,7 @@ from trading_safety import (
     is_take_profit_armed,
     market_trend_allows_entries,
     kiwoom_minute_rows_to_frame,
-    portfolio_equity_usd,
+    account_equity_usd,
     record_ticker_sell,
     record_stop_loss,
     reserve_ticker_buy,
@@ -292,8 +292,8 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
             # 청산 후 USD 현금과 잔여 보유주식 평가액을 합산
             final_deposit = client.get_deposit()
             final_holdings = client.get_balance().get("result_list", [])
-            final_balance = portfolio_equity_usd(
-                final_deposit.get("usd_deposit", 0.0), final_holdings
+            final_balance = account_equity_usd(
+                client, final_deposit.get("usd_deposit", 0.0), final_holdings
             )
             if INITIAL_BALANCE is None:
                 risk_state = get_circuit_breaker_status(final_balance)
@@ -318,7 +318,7 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
     
    
     if INITIAL_BALANCE is None:
-        current_equity = portfolio_equity_usd(usd_available, holdings)
+        current_equity = account_equity_usd(client, usd_available, holdings)
         risk_state = get_circuit_breaker_status(current_equity)
         INITIAL_BALANCE = risk_state["starting_balance"] or current_equity
     # 1단계: 보유 종목 동적 익절/손절 감시
