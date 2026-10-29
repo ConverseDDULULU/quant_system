@@ -129,10 +129,15 @@ class KiwoomClient:
 
         try:
             res = requests.post(url, headers=headers, json=body, timeout=10)
-            if res.status_code == 200:
-                data = res.json()
-                return data.get("result_list") or data.get("output1") or []
-            return []
+            data = res.json() if res.status_code == 200 else {}
+            if res.status_code != 200 or str(data.get("return_code", "0")) != "0":
+                # 실패 시 빈 목록이 '보유 없음'으로 오인되므로 로그로 남긴다
+                print(
+                    f"⚠️ 미국주식 보유종목 조회 오류: HTTP {res.status_code} "
+                    f"[{data.get('return_code')}] {data.get('return_msg', '응답 없음')}"
+                )
+                return []
+            return data.get("result_list") or data.get("output1") or []
         except Exception as e:
             print(f"⚠️ 미국주식 보유종목 조회 실패: {e}")
             return []
