@@ -20,7 +20,7 @@ MARKET_CACHE_SECONDS = 300
 STOP_LOSS_PCT = -1.8
 TAKE_PROFIT_PCT = 3.5
 MAX_TAKE_PROFIT_PCT = 7.0
-KNOWN_EXCHANGE_CODES = {"GRAB": "ND", "RIOT": "ND", "SOXL": "AM"}
+KNOWN_EXCHANGE_CODES = {"GRAB": "ND", "RIOT": "ND", "SOXL": "NA"}
 
 _market_cache_lock = threading.Lock()
 _market_cache_time = 0.0
@@ -199,7 +199,7 @@ def get_rotating_us_candidates(
     for row in ranked_rows:
         ticker = str(row.get("stk_cd", "")).strip().upper()
         exchange = str(row.get("stex_tp", "")).strip().upper()
-        if not ticker or (exchange != "ND" and not (ticker == "SOXL" and exchange == "AM")):
+        if not ticker or (exchange != "ND" and not (ticker == "SOXL" and exchange == "NA")):
             continue
         try:
             price = float(str(row.get("cur_prc", "0")).replace(",", "").replace("+", ""))

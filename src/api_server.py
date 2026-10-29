@@ -91,7 +91,7 @@ US_STOCK_MASTER = list(DEFAULT_US_STOCKS)
 
 def get_kiwoom_exchange_code(ticker: str) -> str:
     market_codes = {
-        "NAS": "ND", "NYS": "NY", "AMS": "AM", "NA": "AM",
+        "NAS": "ND", "NYS": "NY", "AMS": "NA", "NA": "NA",
     }
     normalized_ticker = ticker.upper().strip()
     known_exchange = get_known_exchange_code(normalized_ticker)
@@ -106,7 +106,7 @@ def get_kiwoom_exchange_code(ticker: str) -> str:
 
     try:
         exchange = kiwoom.get_us_exchange_code(normalized_ticker) if kiwoom else ""
-        if exchange in {"ND", "NY", "AM"}:
+        if exchange in {"ND", "NY", "NA"}:
             return exchange
     except Exception:
         pass
@@ -385,7 +385,7 @@ def real_trading_engine():
             ticker = candidate["ticker"]
             try:
                 exchange_code = candidate.get("exchange") or get_kiwoom_exchange_code(ticker)
-                is_soxl_amex = ticker == "SOXL" and exchange_code == "AM"
+                is_soxl_amex = ticker == "SOXL" and exchange_code == "NA"
                 if exchange_code != "ND" and not is_soxl_amex and ticker not in active_positions:
                     print(f"⏭️ [NASDAQ 전용] {ticker} 매수 스캔 제외 (거래소: {exchange_code})")
                     continue
@@ -721,7 +721,7 @@ def get_candles(ticker: str, timeframe: str = Query("1D")):
     try:
         normalized_ticker = ticker.upper().strip()
         exchange = get_kiwoom_exchange_code(normalized_ticker)
-        if exchange not in {"ND", "NY", "AM"}:
+        if exchange not in {"ND", "NY", "NA"}:
             raise HTTPException(status_code=404, detail="키움 거래소 정보를 찾을 수 없습니다.")
 
         today_ny = datetime.now(pytz.timezone("America/New_York")).date()

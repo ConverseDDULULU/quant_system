@@ -211,14 +211,14 @@ def get_bottom_reversal_signal(client: KiwoomClient, ticker: str, exchange: str)
         return None
     
 def get_exchange_code(client: KiwoomClient, ticker: str) -> str:
-    """티커 심볼에 따라 키움 거래소 구분 코드(ND/NY/AM) 반환"""
+    """티커 심볼에 따라 키움 거래소 구분 코드(ND/NY/NA) 반환"""
     known_exchange = get_known_exchange_code(ticker)
     if known_exchange:
         return known_exchange
 
     try:
         exchange = client.get_us_exchange_code(ticker)
-        if exchange in {"ND", "NY", "AM"}:
+        if exchange in {"ND", "NY", "NA"}:
             return exchange
     except Exception:
         pass
@@ -448,7 +448,7 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
         )
 
         if sig == "BUY":
-            is_soxl_amex = ticker == "SOXL" and exchange_code == "AM"
+            is_soxl_amex = ticker == "SOXL" and exchange_code == "NA"
             if exchange_code != "ND" and not is_soxl_amex:
                 print(
                     f"   ⏭️ [NASDAQ 전용] {ticker} 매수 차단 (거래소: {exchange_code})"

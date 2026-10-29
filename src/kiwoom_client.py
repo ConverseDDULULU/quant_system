@@ -2,6 +2,7 @@ import os
 import json
 import math
 import time
+import pytz
 import requests
 from datetime import datetime
 from dotenv import load_dotenv
@@ -203,7 +204,7 @@ class KiwoomClient:
     def get_us_exchange_code(self, ticker: str) -> str:
         """종목 마스터에서 키움 미국 거래소 코드를 찾는다."""
         ticker = ticker.upper().strip()
-        for exchange in ("ND", "NY", "AM"):
+        for exchange in ("ND", "NY", "NA"):
             for item in self.get_us_stock_master(exchange):
                 if str(item.get("stk_cd", "")).upper().strip() == ticker:
                     return exchange
@@ -501,16 +502,16 @@ class KiwoomClient:
         exchange_code = str(exchange or "").upper()
         is_buy = order_type.upper() == "BUY"
 
-        if exchange_code not in {"ND", "NY", "AM"}:
+        if exchange_code not in {"ND", "NY", "NA"}:
             return {
                 "return_code": -1,
                 "return_msg": f"거래소 확인 불가로 주문을 차단했습니다: {ticker} ({exchange_code or 'UNKNOWN'})",
             }
-        is_soxl_amex = ticker.upper().strip() == "SOXL" and exchange_code == "AM"
+        is_soxl_amex = ticker.upper().strip() == "SOXL" and exchange_code == "NA"
         if is_buy and exchange_code != "ND" and not is_soxl_amex:
             return {
                 "return_code": -1,
-                "return_msg": f"NASDAQ 또는 SOXL(AM)만 매수할 수 있습니다: {ticker} (거래소 {exchange_code})",
+                "return_msg": f"NASDAQ 또는 SOXL(NA)만 매수할 수 있습니다: {ticker} (거래소 {exchange_code})",
             }
 
         if not self.access_token:
