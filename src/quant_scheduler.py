@@ -9,6 +9,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 import warnings
 import pytz
+from market_calendar import market_phase, next_market_open, now_ny, seconds_until_next_open
 from trade_logger import finalize_daily_summary, record_trade
 from trading_safety import (
     MAX_TAKE_PROFIT_PCT,
@@ -34,6 +35,8 @@ from trading_safety import (
 # 당일 세션 데이터 추적용 전역 변수
 INITIAL_BALANCE = None  # 장 시작 시 최초 1회 기록
 DAILY_COMPLETED_TRADES = []  # 오늘 청산된 종목 누적 리스트
+CURRENT_TRADING_DATE = None  # 뉴욕 기준 거래일 (바뀌면 당일 상태 초기화)
+SUMMARY_SENT_DATE = None  # 일일 결산을 이미 보낸 거래일
 
 warnings.filterwarnings("ignore")
 warnings.simplefilter(action="ignore", category=FutureWarning)
@@ -222,7 +225,14 @@ def get_exchange_code(client: KiwoomClient, ticker: str) -> str:
 
 def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
     """자동매매 1회 점검 사이클 (+3.5% 익절 / +7.0% 강제 익절 / -1.8% 손절)"""
-    global INITIAL_BALANCE
+    global INITIAL_BALANCE, DAILY_COMPLETED_TRADES, CURRENT_TRADING_DATE, SUMMARY_SENT_DATE
+    trading_date = now_ny().date().isoformat()
+    if CURRENT_TRADING_DATE != trading_date:
+        # 24시간 상시 가동 시 전날 시작 잔고·청산 내역이 이월되지 않도록 초기화
+        CURRENT_TRADING_DATE = trading_date
+        INITIAL_BALANCE = None
+        DAILY_COMPLETED_TRADES = []
+
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print("\n" + "=" * 65)
     print(
@@ -243,7 +253,9 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
         else:
             print("💤 장마감 직전입니다. 포지션이 없으므로 대기합니다.")
 
-        # ==================== [③번 일일 결산 추가 위치] ====================
+        # 마감 구간 동안 매 사이클 청산은 재시도하되, 결산은 하루 한 번만 보낸다
+        if SUMMARY_SENT_DATE == trading_date:
+            return
         try:
             # 청산 후 USD 현금과 잔여 보유주식 평가액을 합산
             final_deposit = client.get_deposit()
@@ -262,6 +274,7 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
                 completed_trades=DAILY_COMPLETED_TRADES,
                 discord_sender=send_discord_message,  # 스케줄러의 디스코드 전송 함수명
             )
+            SUMMARY_SENT_DATE = trading_date
         except Exception as e:
             print(f"⚠️ 일일 결산 생성 중 오류: {e}")
         return
@@ -490,19 +503,9 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
 
 
 def is_market_closing_time() -> bool:
-    """미국 정규장 마감 10분 전인지 확인 (뉴욕 시간 기준 15:50 ~ 15:59)"""
+    """미국 정규장 마감 10분 전인지 확인 (평일 15:50~16:00, 조기폐장일 12:50~13:00)"""
     try:
-        ny_tz = pytz.timezone("America/New_York")
-        now_ny = datetime.now(ny_tz)
-
-        # 월요일(0) ~ 금요일(4) 정규장 체크
-        if now_ny.weekday() >= 5:
-            return False
-
-        # 뉴욕 현지 시각 15시 50분 ~ 15시 59분 (장마감 10분 전 구간)
-        if now_ny.hour == 15 and 50 <= now_ny.minute <= 59:
-            return True
-        return False
+        return market_phase() == "closing"
     except Exception as e:
         print(f"⚠️ 시간 계산 오류: {e}")
         return False
@@ -582,7 +585,33 @@ def main():
     client = KiwoomClient()
     dry_run = False  # 실거래 집행 모드
 
+    was_open = None
+
     while True:
+        is_open = market_phase() != "closed"
+
+        if not is_open:
+            next_open = next_market_open()
+            if was_open is not False:
+                kst_open = next_open.astimezone(pytz.timezone("Asia/Seoul"))
+                message = (
+                    f"💤 [장 종료/휴장] 다음 정규장 개장: 뉴욕 {next_open:%m-%d %H:%M} "
+                    f"(한국 {kst_open:%m-%d %H:%M}). 그때까지 매매를 쉽니다."
+                )
+                print(message)
+                if was_open:
+                    send_discord_message(message)
+            was_open = False
+            # 개장 직후에 깨어나도록 최대 5분 단위로 나눠 대기
+            time.sleep(min(300, max(1, seconds_until_next_open())))
+            continue
+
+        if not was_open:
+            send_discord_message(
+                f"🔔 [정규장 개장] 자동매매 가동 시작 (모드: {'가상' if dry_run else '실거래'})"
+            )
+        was_open = True
+
         try:
             run_trading_cycle(client, dry_run=dry_run)
         except Exception as e:

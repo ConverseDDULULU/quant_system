@@ -19,6 +19,7 @@ warnings.simplefilter(action="ignore", category=Warning)
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../config/.env"), override=True)
 
 from kiwoom_client import KiwoomClient
+from market_calendar import market_phase, seconds_until_next_open
 from trading_safety import (
     MAX_TAKE_PROFIT_PCT,
     TAKE_PROFIT_PCT,
@@ -191,10 +192,8 @@ def submit_us_stock_order(
     return accepted, result.get("return_msg", "응답 없음")
 
 def is_new_entry_cutoff_time() -> bool:
-    now_ny = datetime.now(pytz.timezone("America/New_York"))
-    return now_ny.weekday() < 5 and (
-        now_ny.hour > 15 or (now_ny.hour == 15 and now_ny.minute >= 50)
-    )
+    """장 마감 10분 전 또는 장외 시간이면 신규 진입 차단 (조기폐장일 반영)"""
+    return market_phase() != "open"
 
 def fetch_real_news_and_ai_report(ticker: str, action: str, price: float) -> str:
     """yfinance 실시간 뉴스 수집 + Gemini 2.5 Flash 200자 브리핑"""
@@ -324,6 +323,11 @@ def real_trading_engine():
     print("⚡ [엔진] 1분봉 5대 핵심 지표(VWAP/OBV/ADX/이평/거래량) 실전 감시 가동 시작")
 
     while True:
+        # 정규장(휴장일·조기폐장 반영) 외 시간에는 시세 조회·주문 없이 대기
+        if market_phase() == "closed":
+            time.sleep(min(300, max(1, seconds_until_next_open())))
+            continue
+
         # 가용 예수금 실시간 확인
         available_usd = 0.0
         usd_direct = 0.0
