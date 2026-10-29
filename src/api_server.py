@@ -565,7 +565,11 @@ def real_trading_engine():
 
         time.sleep(10)  
 
-threading.Thread(target=real_trading_engine, daemon=True).start()
+# quant-scheduler와 같은 계좌로 이중 주문하지 않도록 기본은 끔 (ENABLE_API_TRADING_ENGINE=1로 켬)
+if os.getenv("ENABLE_API_TRADING_ENGINE", "0") == "1":
+    threading.Thread(target=real_trading_engine, daemon=True).start()
+else:
+    print("⏸️ [엔진] API 서버 내 실매매 엔진 꺼짐 (매매는 quant-scheduler 담당)")
 
 # --- 프론트엔드 연동 엔드포인트 ---
 
