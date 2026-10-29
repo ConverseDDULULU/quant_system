@@ -1,0 +1,19 @@
+[Unit]
+Description=Quant FastAPI Backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__APP_USER__
+WorkingDirectory=__APP_DIR__
+Environment=PYTHONPATH=src:.
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+# 외부 공개하지 않고 서버 내부(127.0.0.1)에서만 열림 → SSH 터널로 접속
+ExecStart=__APP_DIR__/.venv/bin/python -m uvicorn api_server:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
