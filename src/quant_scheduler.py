@@ -25,6 +25,7 @@ from trading_safety import (
     finish_ticker_buy,
     has_ticker_activity_today,
     is_momentum_continuing,
+    is_aggressive_entry_mode,
     is_take_profit_armed,
     market_trend_allows_entries,
     kiwoom_minute_rows_to_frame,
@@ -220,6 +221,21 @@ def get_bottom_reversal_signal(client: KiwoomClient, ticker: str, exchange: str)
             signal = "BUY"
         elif cur_price < (ema20 * 0.98):
             signal = "SELL"
+        elif is_aggressive_entry_mode():
+            # 공격 모드: 양봉 반등·VWAP 지지·OBV 유입은 필수, 나머지는 넓힌 범위로 4개 중 3개
+            relaxed_checks = [
+                30.0 <= rsi <= 60.0,
+                97.5 <= disparity_20 <= 102.5,
+                vol_surge >= 2.0,
+                (cur_slow_k > cur_slow_d) and (20.0 <= cur_slow_k <= 80.0),
+            ]
+            if (
+                is_reversal_candle
+                and vwap_supported
+                and is_obv_up
+                and sum(relaxed_checks) >= 3
+            ):
+                signal = "BUY"
 
         return {
             "signal": signal,

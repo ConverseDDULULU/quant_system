@@ -486,6 +486,11 @@ def record_stop_loss(
     return get_circuit_breaker_status(starting_balance)
 
 
+def is_aggressive_entry_mode() -> bool:
+    """.env ENTRY_MODE=aggressive 이면 진입 조건 완화 (기본 normal)"""
+    return os.getenv("ENTRY_MODE", "normal").strip().lower() == "aggressive"
+
+
 def market_trend_allows_entries(client) -> tuple[bool, str]:
     global _market_cache_time, _market_cache_result
 
@@ -505,14 +510,16 @@ def market_trend_allows_entries(client) -> tuple[bool, str]:
                 result = (False, "QQQ 5분봉 데이터 부족")
             else:
                 ema20 = completed.ewm(span=20, adjust=False).mean()
-                trend_ok = (
-                    completed.iloc[-1] > ema20.iloc[-1]
-                    and ema20.iloc[-1] > ema20.iloc[-4]
-                )
-                result = (
-                    bool(trend_ok),
-                    "QQQ EMA20 위·상승" if trend_ok else "QQQ EMA20 아래 또는 하락",
-                )
+                above = completed.iloc[-1] > ema20.iloc[-1]
+                rising = ema20.iloc[-1] > ema20.iloc[-4]
+                if is_aggressive_entry_mode():
+                    # 공격 모드: 지수가 EMA20 2% 이상 아래로 무너진 급락장만 차단
+                    trend_ok = completed.iloc[-1] > ema20.iloc[-1] * 0.98
+                    reason = "[공격 모드] QQQ 급락장 아님" if trend_ok else "[공격 모드] QQQ EMA20 -2% 이탈 급락장"
+                else:
+                    trend_ok = above and rising
+                    reason = "QQQ EMA20 위·상승" if trend_ok else "QQQ EMA20 아래 또는 하락"
+                result = (bool(trend_ok), reason)
         except Exception as exc:
             result = (False, f"QQQ 장세 조회 실패: {exc}")
 
