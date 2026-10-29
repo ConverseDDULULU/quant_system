@@ -41,6 +41,7 @@ class KiwoomClient:
 
         self.full_account_no = None  # 10자리 정규 계좌번호
         self.access_token = None
+        self.token_expires_at = None  # KST 기준 만료 시각
         self.base_url = "https://api.kiwoom.com"
         self._us_stock_master_cache = {}
         self._us_stock_master_cache_time = {}
@@ -70,6 +71,7 @@ class KiwoomClient:
         self.access_token = data.get("token") or data.get("access_token")
         if not self.access_token:
             raise RuntimeError(f"키움 토큰 발급 실패: {data}")
+        self.token_expires_at = self._parse_token_expiry(data.get("expires_dt"))
 
         # 계좌번호 조회 (ka00001)
         acct_url = f"{self.base_url}/api/dostk/acnt"
@@ -93,8 +95,30 @@ class KiwoomClient:
 
         print(f"🔑 [KiwoomClient] 로그인 완료: 계좌번호={self.full_account_no}")
 
+    @staticmethod
+    def _parse_token_expiry(expires_dt):
+        """au10001 expires_dt(YYYYMMDDHHMMSS, KST)를 aware datetime으로 변환"""
+        try:
+            naive = datetime.strptime(str(expires_dt).strip(), "%Y%m%d%H%M%S")
+            return pytz.timezone("Asia/Seoul").localize(naive)
+        except (TypeError, ValueError):
+            return None
+
+    def _ensure_token(self):
+        """토큰이 없거나 만료 10분 전이면 재발급한다 (24시간 가동 대비)."""
+        if not self.access_token:
+            self.authenticate()
+            return
+        if self.token_expires_at is None:
+            return
+        now = datetime.now(pytz.timezone("Asia/Seoul"))
+        if (self.token_expires_at - now).total_seconds() < 600:
+            print("🔄 [KiwoomClient] 토큰 만료 임박, 재발급합니다.")
+            self.authenticate()
+
     def get_us_holdings(self) -> list:
         """미국주식 원장잔고확인 (ust21070)"""
+        self._ensure_token()
         url = f"{self.base_url}/api/us/acnt"
         headers = {
             "Content-Type": "application/json;charset=UTF-8",
@@ -115,6 +139,7 @@ class KiwoomClient:
 
     def get_us_balance(self) -> dict:
         """해외주식 예수금 조회 (ust21110) + 보유잔고 병합"""
+        self._ensure_token()
         url = f"{self.base_url}/api/us/acnt"
         headers = {
             "Content-Type": "application/json;charset=UTF-8",
@@ -147,8 +172,7 @@ class KiwoomClient:
         if cached and not refresh and time.monotonic() - cached_at < 21600:
             return list(cached)
 
-        if not self.access_token:
-            self.authenticate()
+        self._ensure_token()
 
         url = f"{self.base_url}/api/us/stkinfo"
         rows = []
@@ -212,8 +236,7 @@ class KiwoomClient:
 
     def get_us_stock_quote(self, ticker: str, exchange: str = "ND") -> dict:
         """키움 미국주식 현재가·누적거래량(usa20100)을 조회한다."""
-        if not self.access_token:
-            self.authenticate()
+        self._ensure_token()
 
         headers = {
             "Content-Type": "application/json;charset=UTF-8",
@@ -246,8 +269,7 @@ class KiwoomClient:
         if cached and not refresh and time.monotonic() - cached_at < 30:
             return list(cached)
 
-        if not self.access_token:
-            self.authenticate()
+        self._ensure_token()
 
         rows = []
         cont_yn = "N"
@@ -319,8 +341,7 @@ class KiwoomClient:
         max_pages: int,
         cache_key: tuple,
     ) -> list:
-        if not self.access_token:
-            self.authenticate()
+        self._ensure_token()
         cached_rows = self._us_minute_chart_cache.get(cache_key)
         cached_at = self._us_minute_chart_cache_time.get(cache_key, 0.0)
         if cached_rows and time.monotonic() - cached_at < 10:
@@ -466,7 +487,8 @@ class KiwoomClient:
             if not exchange:
                 return 0.0
             quote = self.get_us_stock_quote(ticker, exchange)
-            return safe_float(quote.get("cur_prc"))
+            # usa20100 cur_prc는 등락 부호가 붙어 온다(예: "-0.0206")
+            return abs(safe_float(quote.get("cur_prc")))
         except Exception:
             pass
         return 0.0
@@ -514,8 +536,7 @@ class KiwoomClient:
                 "return_msg": f"NASDAQ 또는 SOXL(NA)만 매수할 수 있습니다: {ticker} (거래소 {exchange_code})",
             }
 
-        if not self.access_token:
-            self.authenticate()
+        self._ensure_token()
 
         if qty <= 0:
             return {"return_code": -1, "return_msg": "주문 수량이 0 이하입니다."}
