@@ -66,7 +66,7 @@ kiwoom = None
 try:
     kiwoom = KiwoomClient()
     print("🔑 [KIWOOM] 클라이언트 인스턴스 생성 성공:", kiwoom)
-    print("🔑 [KIWOOM] 토큰 상태:", getattr(kiwoom, "access_token", None))
+    print("🔑 [KIWOOM] 토큰 상태:", "발급됨" if getattr(kiwoom, "access_token", None) else "없음")
 except Exception as e:
     print(f"❌ [KIWOOM] 클라이언트 초기화 실패 원인: {e}")
 
