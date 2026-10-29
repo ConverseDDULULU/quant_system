@@ -20,9 +20,10 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../config/.env"
 
 from kiwoom_client import KiwoomClient
 from market_calendar import market_phase, seconds_until_next_open
+import strategy_params
+import trading_safety
+from trade_logger import record_trade
 from trading_safety import (
-    MAX_TAKE_PROFIT_PCT,
-    TAKE_PROFIT_PCT,
     arm_take_profit,
     clear_position_exit_state,
     get_exit_rule,
@@ -352,6 +353,8 @@ def real_trading_engine():
             except Exception:
                 DAILY_STARTING_EQUITY = usd_direct
             DAILY_START_DATE = today_ny
+            # 전날 장 마감 후 자동 조정된 익절·손절 기준 반영
+            strategy_params.apply_to_engine()
 
         daily_starting_balance = DAILY_STARTING_EQUITY or usd_direct
 
@@ -416,14 +419,14 @@ def real_trading_engine():
                     profit_rate = ((cur_price - buy_price) / buy_price) * 100
                     position_key = f"api:{ticker}:{buy_price:.4f}:{pos['qty']}"
                     take_profit_armed = is_take_profit_armed(position_key)
-                    if profit_rate >= TAKE_PROFIT_PCT:
+                    if profit_rate >= trading_safety.TAKE_PROFIT_PCT:
                         take_profit_armed = True
                         if not IS_DRY_RUN:
                             arm_take_profit(position_key)
 
                     momentum_continues = bool(
                         ind.get("momentum_continues", False)
-                    ) if take_profit_armed and profit_rate < MAX_TAKE_PROFIT_PCT else False
+                    ) if take_profit_armed and profit_rate < trading_safety.MAX_TAKE_PROFIT_PCT else False
                     exit_rule = get_exit_rule(
                         profit_rate,
                         momentum_continues=momentum_continues,
@@ -432,12 +435,12 @@ def real_trading_engine():
 
                     if exit_rule:
                         exit_labels = {
-                            "STOP_LOSS": ("🛑", "손절", "손절 기준 -1.8% 도달"),
-                            "TAKE_PROFIT": ("🎉", "익절", "익절 기준 +3.5% 도달"),
+                            "STOP_LOSS": ("🛑", "손절", f"손절 기준 {trading_safety.STOP_LOSS_PCT}% 도달"),
+                            "TAKE_PROFIT": ("🎉", "익절", f"익절 기준 +{trading_safety.TAKE_PROFIT_PCT}% 도달"),
                             "MAX_TAKE_PROFIT": (
                                 "🚀",
                                 "최대 상한 익절",
-                                "최대 익절 기준 +7.0% 도달",
+                                f"최대 익절 기준 +{trading_safety.MAX_TAKE_PROFIT_PCT}% 도달",
                             ),
                         }
                         emoji, exit_name, exit_reason = exit_labels[exit_rule]
@@ -451,6 +454,18 @@ def real_trading_engine():
                             print(f"❌ [{exit_name} 매도 주문 실패] {ticker}: {order_status}")
                             continue
                         clear_position_exit_state(position_key)
+                        if not IS_DRY_RUN:
+                            try:
+                                # 체결가가 아니라 주문 시점 현재가 기준 추정치
+                                record_trade(
+                                    ticker,
+                                    buy_price,
+                                    cur_price,
+                                    pos["qty"],
+                                    {"STOP_LOSS": "손절", "TAKE_PROFIT": "익절", "MAX_TAKE_PROFIT": "최대익절"}[exit_rule],
+                                )
+                            except Exception as e:
+                                print(f"⚠️ 매매 기록 저장 실패: {e}")
 
                         if exit_rule == "STOP_LOSS" and not IS_DRY_RUN:
                             breaker = record_stop_loss(

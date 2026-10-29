@@ -3,6 +3,8 @@ from datetime import datetime
 import os
 from typing import Any, Dict, List
 
+from market_calendar import now_ny
+
 DATA_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data"
 )
@@ -60,7 +62,7 @@ def record_trade(
 
     row = {
         "timestamp": now_str,
-        "date": datetime.now().strftime("%Y-%m-%d"),
+        "date": now_ny().date().isoformat(),  # 뉴욕 거래일 (서버 시간대와 무관)
         "ticker": ticker,
         "buy_price": round(buy_price, 4),
         "sell_price": round(sell_price, 4),
@@ -93,7 +95,7 @@ def finalize_daily_summary(
     file_exists = os.path.exists(DAILY_CSV)
     deduplicate_daily_summaries()
     file_exists = os.path.exists(DAILY_CSV)
-    date_str = datetime.now().strftime("%Y-%m-%d")
+    date_str = now_ny().date().isoformat()  # 뉴욕 거래일
 
     net_profit = end_balance - start_balance
     daily_return = (

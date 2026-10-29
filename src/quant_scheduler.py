@@ -9,12 +9,13 @@ from datetime import datetime
 from dotenv import load_dotenv
 import warnings
 import pytz
+import daily_review
+import strategy_params
+import trading_safety
 from market_calendar import market_phase, next_market_open, now_ny, seconds_until_next_open
 from overnight_hold import select_overnight_holds
 from trade_logger import finalize_daily_summary, record_trade
 from trading_safety import (
-    MAX_TAKE_PROFIT_PCT,
-    TAKE_PROFIT_PCT,
     arm_take_profit,
     clear_position_exit_state,
     get_exit_rule,
@@ -54,7 +55,33 @@ from src.kiwoom_client import KiwoomClient
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 
-MAX_BUY_QTY = 5
+# 익절·손절·수량 등 매매 조건 (data/strategy_params.json, 거래일마다 다시 읽음)
+PARAMS = strategy_params.apply_to_engine()
+
+
+def _log_completed_trade(ticker, buy_price, sell_price, qty, exit_reason):
+    """매도 주문 접수 시 매매 기록 (마감 구간 재시도로 같은 청산이 중복 기록되지 않게)"""
+    for t in DAILY_COMPLETED_TRADES:
+        if t["ticker"] == ticker and t["qty"] == qty and t["exit_reason"] == exit_reason:
+            return
+    if buy_price <= 0 or sell_price <= 0:
+        print(f"⚠️ [매매 기록 건너뜀] {ticker}: 매입가/현재가 정보 없음")
+        return
+    profit_pct = (sell_price - buy_price) / buy_price * 100
+    DAILY_COMPLETED_TRADES.append(
+        {
+            "ticker": ticker,
+            "qty": qty,
+            "exit_reason": exit_reason,
+            "profit_pct": profit_pct,
+            "profit_usd": (sell_price - buy_price) * qty,
+        }
+    )
+    try:
+        # 체결가가 아니라 주문 시점 현재가 기준 추정치
+        record_trade(ticker, buy_price, sell_price, qty, exit_reason)
+    except Exception as e:
+        print(f"⚠️ 매매 기록 저장 실패: {e}")
 
 
 def send_discord_message(content: str):
@@ -227,13 +254,16 @@ def get_exchange_code(client: KiwoomClient, ticker: str) -> str:
 
 def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
     """자동매매 1회 점검 사이클 (+3.5% 익절 / +7.0% 강제 익절 / -1.8% 손절)"""
-    global INITIAL_BALANCE, DAILY_COMPLETED_TRADES, CURRENT_TRADING_DATE, SUMMARY_SENT_DATE
+    global INITIAL_BALANCE, DAILY_COMPLETED_TRADES, CURRENT_TRADING_DATE, SUMMARY_SENT_DATE, PARAMS
     trading_date = now_ny().date().isoformat()
     if CURRENT_TRADING_DATE != trading_date:
         # 24시간 상시 가동 시 전날 시작 잔고·청산 내역이 이월되지 않도록 초기화
         CURRENT_TRADING_DATE = trading_date
         INITIAL_BALANCE = None
         DAILY_COMPLETED_TRADES = []
+        # 전날 장 마감 후 자동 조정된 매매 조건 반영
+        PARAMS = strategy_params.apply_to_engine()
+        print(f"⚙️ [매매 조건] {PARAMS}")
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print("\n" + "=" * 65)
@@ -318,13 +348,13 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
             take_profit_armed = (
                 not dry_run and is_take_profit_armed(position_key)
             )
-            if profit_rate >= TAKE_PROFIT_PCT:
+            if profit_rate >= trading_safety.TAKE_PROFIT_PCT:
                 take_profit_armed = True
                 if not dry_run:
                     arm_take_profit(position_key)
 
             momentum_continues = False
-            if take_profit_armed and profit_rate < MAX_TAKE_PROFIT_PCT:
+            if take_profit_armed and profit_rate < trading_safety.MAX_TAKE_PROFIT_PCT:
                 exchange_code = get_exchange_code(client, ticker)
                 analysis = get_bottom_reversal_signal(client, ticker, exchange_code)
                 momentum_continues = bool(
@@ -350,6 +380,8 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
                 print(f"   ➔ {sell_reason}")
 
                 if not dry_run:
+                    # 익절 대기 상태가 아닌 손절에서는 위에서 거래소 코드를 조회하지 않으므로 여기서 확정
+                    exchange_code = get_exchange_code(client, ticker)
                     sell_target_price = format_us_price(now_price * 0.99)
                     res = client.order_us_stock(
                         ticker=ticker,
@@ -367,6 +399,13 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
                     if str(return_code) == "0":
                         clear_position_exit_state(position_key)
                         record_ticker_sell(ticker)
+                        _log_completed_trade(
+                            ticker,
+                            buy_price,
+                            now_price,
+                            qty,
+                            {"STOP_LOSS": "손절", "TAKE_PROFIT": "익절", "MAX_TAKE_PROFIT": "최대익절"}[exit_rule],
+                        )
                         if exit_rule == "STOP_LOSS":
                             breaker = record_stop_loss(
                                 position_key=f"scheduler:{ticker}:{buy_price:.4f}:{qty}",
@@ -401,7 +440,7 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
         print(f"📉 [시장 장세 필터] 신규 매수 차단: {market_reason}")
         return
 
-    MAX_HOLDINGS = 3
+    MAX_HOLDINGS = PARAMS["max_holdings"]
     if len(held_tickers) >= MAX_HOLDINGS:
         print(
             f"\n🔒 [보유 슬롯 만석] 현재 {len(held_tickers)}/{MAX_HOLDINGS} 종목 보유 중으로 신규 매수를 대기합니다."
@@ -468,7 +507,7 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
                     )
                     continue
 
-                buy_qty = min(MAX_BUY_QTY, int(usd_available / numeric_price))
+                buy_qty = min(PARAMS["max_buy_qty"], int(usd_available / numeric_price))
                 if buy_qty <= 0:
                     print(
                         f"   ⚠️ [주문 스킵] {ticker} 단가(${numeric_price:.2f})가 잔여 예수금(${usd_available:.2f})보다 큽니다."
@@ -613,6 +652,11 @@ def liquidate_all_positions(client, held_positions: list):
         if str(code) == "0":
             accepted_orders += 1
             record_ticker_sell(ticker)
+            try:
+                buy_price = float(str(item.get("frgn_stk_book_uv", "0")).replace(",", "").strip() or "0")
+            except (TypeError, ValueError):
+                buy_price = 0.0
+            _log_completed_trade(ticker, buy_price, curr_price, qty, "장마감청산")
         else:
             skipped_orders += 1
         time.sleep(1)
@@ -644,6 +688,11 @@ def main():
                 if was_open:
                     send_discord_message(message)
             was_open = False
+            # 장 마감 후 하루 1회: 매매 분석 → 조건 조정 → 증시 보고서 (재시작해도 중복 실행 안 함)
+            try:
+                daily_review.run_if_due(discord_sender=send_discord_message)
+            except Exception as e:
+                print(f"⚠️ 일일 분석 실행 오류: {e}")
             # 개장 직후에 깨어나도록 최대 5분 단위로 나눠 대기
             time.sleep(min(300, max(1, seconds_until_next_open())))
             continue
