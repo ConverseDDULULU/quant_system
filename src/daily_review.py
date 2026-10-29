@@ -30,6 +30,7 @@ import yfinance as yf
 from dotenv import load_dotenv
 
 import strategy_params
+from gemini_client import generate_text
 from market_calendar import is_trading_day, now_ny, session_bounds
 from trade_logger import DAILY_CSV, TRADE_CSV
 
@@ -236,9 +237,6 @@ def propose_changes(stats: dict, follow: dict, holds: list[dict], params: dict) 
 # ---------------------------------------------------------------- 보고서
 
 def _gemini_commentary(payload: dict) -> str:
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    if not api_key:
-        return ""
     prompt = (
         "당신은 미국 주식 단타 자동매매 시스템의 일일 리뷰어입니다. 아래 JSON은 오늘 시장 지표, "
         "최근 매매 통계, 자동 조정 결과입니다.\n"
@@ -246,18 +244,7 @@ def _gemini_commentary(payload: dict) -> str:
         "한국어로 600자 이내로 작성하세요: (1) 오늘 시장 흐름 한두 문장 (2) 매매 성과에서 눈에 띄는 점 "
         "(3) 내일 주의할 점. 숫자는 주어진 데이터만 쓰고 새로 지어내지 마세요. 특정 종목 매수 권유는 하지 마세요."
     )
-    try:
-        res = requests.post(
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"gemini-2.5-flash:generateContent?key={api_key}",
-            json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.3}},
-            timeout=30,
-        )
-        res.raise_for_status()
-        return res.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-    except Exception as e:
-        print(f"⚠️ Gemini 해설 생성 실패: {e}")
-        return ""
+    return generate_text(prompt, temperature=0.3, timeout=60) or ""
 
 
 def _day_summary_row(day) -> dict | None:

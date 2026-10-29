@@ -19,6 +19,7 @@ warnings.simplefilter(action="ignore", category=Warning)
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../config/.env"), override=True)
 
 from kiwoom_client import KiwoomClient
+from gemini_client import generate_text
 from market_calendar import market_phase, seconds_until_next_open
 import strategy_params
 import trading_safety
@@ -223,19 +224,9 @@ def fetch_real_news_and_ai_report(ticker: str, action: str, price: float) -> str
         f"3. 템플릿 같은 형식적인 문구는 쓰지 말고 뉴스 내용을 직접 인용하여 분석하세요."
     )
 
-    if GEMINI_API_KEY:
-        try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
-            payload = {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.4}
-            }
-            res = requests.post(url, json=payload, timeout=10)
-            if res.status_code == 200:
-                result = res.json()
-                return result["candidates"][0]["content"]["parts"][0]["text"].strip()
-        except Exception as e:
-            print(f"⚠️ Gemini 호출 에러: {e}")
+    briefing = generate_text(prompt, temperature=0.4, timeout=15)
+    if briefing:
+        return briefing
 
     return f"[{'호재' if action=='BUY' else '악재'}] {ticker} 실시간 이슈: {news_titles[0] if news_titles else '거래량 변동성 확대'}. 현재가 ${price:.2f} 기준으로 단기 수급 변화가 관측되어 {action} 포지션에 진입합니다."
 

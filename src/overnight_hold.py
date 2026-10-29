@@ -15,9 +15,9 @@ import re
 from datetime import timedelta
 from typing import Callable
 
-import requests
 import yfinance as yf
 
+from gemini_client import generate_text
 from market_calendar import is_trading_day, now_ny
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -84,18 +84,10 @@ def get_news_verdict(ticker: str) -> tuple[str, str]:
         + "\n\n이 뉴스가 내일 주가에 호재인지 악재인지 판정하세요. "
         '반드시 JSON 한 줄로만 답하세요: {"verdict": "호재|중립|악재", "reason": "한국어 60자 이내 근거"}'
     )
+    text = generate_text(prompt, temperature=0.1, timeout=20)
+    if text is None:
+        return "중립", "뉴스 판정 실패"
     try:
-        res = requests.post(
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"gemini-2.5-flash:generateContent?key={api_key}",
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.1},
-            },
-            timeout=15,
-        )
-        res.raise_for_status()
-        text = res.json()["candidates"][0]["content"]["parts"][0]["text"]
         match = re.search(r"\{.*\}", text, re.DOTALL)
         parsed = json.loads(match.group(0)) if match else {}
         verdict = parsed.get("verdict", "중립")
