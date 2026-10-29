@@ -28,14 +28,17 @@ export default function AccountView({ onSelectTicker }) {
   if (!acct) return <div style={{ padding: "40px", color: "#ef4444" }}>키움 계좌 정보를 불러올 수 없습니다.</div>;
 
   // 상단 총 손익 및 수익률 안전 추출
-  const totalProfit = Number(acct.total_profit_usd ?? acct.total_pl_usd ?? acct.profit_amt ?? 0);
-  const totalRate = Number(acct.total_return_rate ?? acct.total_profit_rate ?? acct.total_pl_rate ?? 0);
-  const isProfit = totalProfit >= 0;
+  const holdingProfit = Number(acct.total_profit_usd ?? acct.total_pl_usd ?? acct.profit_amt ?? 0);
+  const accountProfit = Number(acct.account_profit_usd ?? 0);
+  const accountRate = Number(acct.account_profit_rate ?? 0);
+  const accountEquity = Number(acct.account_equity_usd ?? 0);
+  const isAccountProfit = accountProfit >= 0;
+  const isHoldingProfit = holdingProfit >= 0;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
       {/* 1. 상단 총 자산 요약 */}
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: "16px" }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: "12px" }}>
         <div style={cardBox}>
           <span style={cardSub}>키움 실계좌 번호</span>
           <span style={cardMain}>{acct.account_no || "-"}</span>
@@ -47,13 +50,20 @@ export default function AccountView({ onSelectTicker }) {
           </span>
         </div>
         <div style={cardBox}>
-          <span style={cardSub}>총 평가금액 (보유주식)</span>
-          <span style={cardMain}>${(acct.total_eval_usd ?? 0).toLocaleString()}</span>
+          <span style={cardSub}>총 계좌자산 (현금 + 보유주)</span>
+          <span style={cardMain}>${accountEquity.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
         </div>
         <div style={cardBox}>
-          <span style={cardSub}>총 평가손익 (수익률)</span>
-          <span style={{ ...cardMain, color: isProfit ? "#ef4444" : "#3b82f6" }}>
-            {isProfit ? "+" : ""}${totalProfit.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ({isProfit ? "+" : ""}{totalRate.toFixed(2)}%)
+          <span style={cardSub}>계좌 전체 손익 / 수익률</span>
+          <span style={{ ...cardMain, color: isAccountProfit ? "#ef4444" : "#3b82f6" }}>
+            {isAccountProfit ? "+" : ""}${accountProfit.toFixed(2)} ({isAccountProfit ? "+" : ""}{accountRate.toFixed(2)}%)
+          </span>
+          <span style={{ fontSize: "10px", color: "#64748b" }}>기준일 {acct.account_baseline_date || "-"} (미국 동부)</span>
+        </div>
+        <div style={cardBox}>
+          <span style={cardSub}>보유주 평가손익</span>
+          <span style={{ ...cardMain, color: isHoldingProfit ? "#ef4444" : "#3b82f6" }}>
+            {isHoldingProfit ? "+" : ""}${holdingProfit.toFixed(2)}
           </span>
         </div>
       </div>

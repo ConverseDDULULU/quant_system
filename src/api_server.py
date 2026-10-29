@@ -8,6 +8,7 @@ import requests
 import pandas as pd
 import yfinance as yf
 import numpy as np
+import pytz
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,6 +19,26 @@ warnings.simplefilter(action="ignore", category=Warning)
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../config/.env"), override=True)
 
 from kiwoom_client import KiwoomClient
+from trading_safety import (
+    MAX_TAKE_PROFIT_PCT,
+    TAKE_PROFIT_PCT,
+    arm_take_profit,
+    clear_position_exit_state,
+    get_exit_rule,
+    get_circuit_breaker_status,
+    get_or_create_account_baseline,
+    get_known_exchange_code,
+    finish_ticker_buy,
+    has_ticker_activity_today,
+    is_momentum_continuing,
+    is_take_profit_armed,
+    market_trend_allows_entries,
+    portfolio_equity_usd,
+    record_ticker_sell,
+    record_stop_loss,
+    reserve_ticker_buy,
+    kiwoom_minute_rows_to_frame,
+)
 
 app = FastAPI(title="Kiwoom Quant Engine with Real-News AI")
 
@@ -31,17 +52,13 @@ app.add_middleware(
 
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-IS_DRY_RUN = True  # 실서버 주문 집행 시 False로 전환
+IS_DRY_RUN = False  # 실서버 주문 집행 시 False로 전환
 
-# 1. 급등주 및 유망 모멘텀 종목 풀 ($2 ~ $30 범위 유동성 대장주)
-MOMENTUM_POOL = [
-    "SOUN", "PLUG", "LCID", "OPEN", "GRAB", "CLOV",
-    "WULF", "CIFR", "RUM", "JOBY", "SOXL", "PLTR"
-]
-
-# 2. 보유 포지션 관리 메모리 (익절/손절/트레일링 추적용)
+# 2. API 엔진이 진입한 보유 포지션 관리 메모리
 # 형태: { ticker: { "buy_price": 5.20, "qty": 3, "highest_price": 5.40 } }
 active_positions = {}
+DAILY_STARTING_EQUITY = None
+DAILY_START_DATE = None
 
 kiwoom = None
 try:
@@ -71,6 +88,30 @@ DEFAULT_US_STOCKS = [
 
 US_STOCK_MASTER = list(DEFAULT_US_STOCKS)
 
+def get_kiwoom_exchange_code(ticker: str) -> str:
+    market_codes = {
+        "NAS": "ND", "NYS": "NY", "AMS": "AM", "NA": "AM",
+    }
+    normalized_ticker = ticker.upper().strip()
+    known_exchange = get_known_exchange_code(normalized_ticker)
+    if known_exchange:
+        return known_exchange
+
+    for stock in US_STOCK_MASTER:
+        if stock.get("ticker", "").upper() == normalized_ticker:
+            market = stock.get("market", "").upper()
+            if market in market_codes:
+                return market_codes[market]
+
+    try:
+        exchange = kiwoom.get_us_exchange_code(normalized_ticker) if kiwoom else ""
+        if exchange in {"ND", "NY", "AM"}:
+            return exchange
+    except Exception:
+        pass
+
+    return "UNKNOWN"
+
 def load_kiwoom_stock_master():
     """키움 API usa10099 종목 마스터 로드 및 병합"""
     global US_STOCK_MASTER
@@ -78,32 +119,23 @@ def load_kiwoom_stock_master():
     if not kiwoom or not kiwoom.access_token:
         return
 
-    url = f"{kiwoom.base_url}/api/us/stkinfo"
-    headers = {
-        "Content-Type": "application/json; charset=utf-8",
-        "authorization": f"Bearer {kiwoom.access_token}",
-        "api-id": "usa10099",
-    }
-
     combined = []
-    for exch in ["NAS", "NYS", "AMS"]:
+    market_names = {"ND": "NAS", "NY": "NYS", "NA": "AMS"}
+    for exchange in ("ND", "NY", "NA"):
         try:
-            res = requests.post(url, headers=headers, json={"exch_cd": exch}, timeout=10)
-            if res.status_code == 200:
-                data = res.json()
-                for item in data.get("stk_list", []):
-                    ticker = item.get("stk_cd", "").strip()
-                    kr_name = item.get("stk_nm_korean", "").strip()
-                    en_name = item.get("stk_nm_eng", "").strip()
-                    if ticker:
-                        combined.append({
-                            "ticker": ticker,
-                            "name_kr": kr_name if kr_name else en_name,
-                            "name_en": en_name,
-                            "market": exch
-                        })
-        except Exception:
-            pass
+            for item in kiwoom.get_us_stock_master(exchange=exchange):
+                ticker = str(item.get("stk_cd", "")).strip().upper()
+                english_name = str(item.get("stk_enm", "")).strip()
+                name = str(item.get("stk_nm", "")).strip() or english_name or ticker
+                if ticker:
+                    combined.append({
+                        "ticker": ticker,
+                        "name_kr": name,
+                        "name_en": english_name or name,
+                        "market": market_names[exchange],
+                    })
+        except Exception as exc:
+            print(f"⚠️ 키움 {exchange} 종목 마스터 조회 실패: {exc}")
 
     if combined:
         seen = set()
@@ -124,6 +156,45 @@ def send_discord(content: str):
         requests.post(DISCORD_WEBHOOK, json={"content": content}, timeout=5)
     except Exception as e:
         print(f"⚠️ 디스코드 오류: {e}")
+
+def submit_us_stock_order(
+    ticker: str, order_type: str, qty: int, price: float, exchange: str | None = None
+):
+    if IS_DRY_RUN:
+        return True, "가상(Dry-Run)"
+    if not kiwoom:
+        return False, "키움 클라이언트가 없습니다."
+
+    normalized_type = order_type.upper()
+    if normalized_type == "BUY" and not reserve_ticker_buy(ticker):
+        return False, "오늘 이미 주문한 종목이라 재진입을 차단했습니다."
+
+    try:
+        result = kiwoom.order_us_stock(
+            ticker,
+            normalized_type,
+            qty,
+            price=price,
+            exchange=exchange or get_kiwoom_exchange_code(ticker),
+        )
+    except Exception as exc:
+        if normalized_type == "BUY":
+            finish_ticker_buy(ticker, accepted=False)
+        return False, str(exc)
+
+    accepted = str(result.get("return_code", -1)) == "0"
+    if normalized_type == "BUY":
+        finish_ticker_buy(ticker, accepted=accepted)
+    elif normalized_type == "SELL" and accepted:
+        record_ticker_sell(ticker)
+
+    return accepted, result.get("return_msg", "응답 없음")
+
+def is_new_entry_cutoff_time() -> bool:
+    now_ny = datetime.now(pytz.timezone("America/New_York"))
+    return now_ny.weekday() < 5 and (
+        now_ny.hour > 15 or (now_ny.hour == 15 and now_ny.minute >= 50)
+    )
 
 def fetch_real_news_and_ai_report(ticker: str, action: str, price: float) -> str:
     """yfinance 실시간 뉴스 수집 + Gemini 2.5 Flash 200자 브리핑"""
@@ -171,12 +242,18 @@ def fetch_real_news_and_ai_report(ticker: str, action: str, price: float) -> str
 def calculate_technical_indicators(df: pd.DataFrame):
     """1분봉 데이터 기반 VWAP, OBV, ADX(14), MA5, MA20 벡터화 계산"""
     try:
+        if df.empty or len(df) < 31:
+            return None
+        df = df.iloc[:-1]
+
         closes = df["Close"].iloc[:, 0] if isinstance(df.columns, pd.MultiIndex) else df["Close"]
         highs = df["High"].iloc[:, 0] if isinstance(df.columns, pd.MultiIndex) else df["High"]
         lows = df["Low"].iloc[:, 0] if isinstance(df.columns, pd.MultiIndex) else df["Low"]
         volumes = df["Volume"].iloc[:, 0] if isinstance(df.columns, pd.MultiIndex) else df["Volume"]
 
         closes = pd.Series(closes.values.flatten(), index=df.index, dtype=float)
+        opens = df["Open"].iloc[:, 0] if isinstance(df.columns, pd.MultiIndex) else df["Open"]
+        opens = pd.Series(opens.values.flatten(), index=df.index, dtype=float)
         highs = pd.Series(highs.values.flatten(), index=df.index, dtype=float)
         lows = pd.Series(lows.values.flatten(), index=df.index, dtype=float)
         volumes = pd.Series(volumes.values.flatten(), index=df.index, dtype=float)
@@ -190,6 +267,15 @@ def calculate_technical_indicators(df: pd.DataFrame):
         direction = np.where(closes > closes.shift(1), 1, np.where(closes < closes.shift(1), -1, 0))
         obv = (volumes * direction).cumsum()
         obv_ma = obv.rolling(10).mean()
+        momentum_continues = is_momentum_continuing(
+            price=float(closes.iloc[-1]),
+            vwap=float(vwap.iloc[-1]),
+            short_ma=float(closes.rolling(5).mean().iloc[-1]),
+            long_ma=float(closes.rolling(20).mean().iloc[-1]),
+            obv=float(obv.iloc[-1]),
+            obv_ma=float(obv_ma.iloc[-1]),
+            candle_green=bool(closes.iloc[-1] >= opens.iloc[-1]),
+        )
 
         # 3. ADX & DMI (+DI, -DI) (추세 강도 분석)
         up_move = highs - highs.shift(1)
@@ -212,12 +298,12 @@ def calculate_technical_indicators(df: pd.DataFrame):
         # 4. 단기 이동평균선 & 평균 거래량
         ma5 = closes.rolling(5).mean()
         ma20 = closes.rolling(20).mean()
-        avg_vol = volumes.rolling(20).mean()
+        avg_vol = volumes.iloc[-21:-1].mean()
 
         return {
             "cur_price": float(closes.iloc[-1]),
             "cur_vol": float(volumes.iloc[-1]),
-            "avg_vol": float(avg_vol.iloc[-1]),
+            "avg_vol": float(avg_vol),
             "vwap": float(vwap.iloc[-1]),
             "obv": float(obv.iloc[-1]),
             "obv_ma": float(obv_ma.iloc[-1]),
@@ -226,19 +312,23 @@ def calculate_technical_indicators(df: pd.DataFrame):
             "minus_di": float(minus_di.iloc[-1]),
             "ma5": float(ma5.iloc[-1]),
             "ma20": float(ma20.iloc[-1]),
+            "momentum_continues": momentum_continues,
         }
     except Exception:
         return None
 
 def real_trading_engine():
-    """예수금 실시간 검증 + 1분봉 5중 복합 퀀트 검증 + 트레일링/상한 익절 + 칼손절 엔진"""
-    global active_positions
+    """5중 진입 검증과 공통 모멘텀 익절·손절을 수행하는 엔진"""
+    global active_positions, DAILY_STARTING_EQUITY, DAILY_START_DATE
     time.sleep(5)
     print("⚡ [엔진] 1분봉 5대 핵심 지표(VWAP/OBV/ADX/이평/거래량) 실전 감시 가동 시작")
 
     while True:
         # 가용 예수금 실시간 확인
         available_usd = 0.0
+        usd_direct = 0.0
+        krw_direct = 0.0
+        daily_starting_balance = 0.0
         if kiwoom:
             try:
                 deposit_info = kiwoom.get_deposit()
@@ -248,10 +338,62 @@ def real_trading_engine():
             except Exception:
                 pass
 
-        for ticker in MOMENTUM_POOL:
+        today_ny = datetime.now(pytz.timezone("America/New_York")).date().isoformat()
+        if DAILY_START_DATE != today_ny:
             try:
-                # 1분봉(1m, 당일 데이터) 수집
-                data = yf.download(ticker, period="1d", interval="1m", progress=False, auto_adjust=True)
+                opening_holdings = kiwoom.get_us_holdings() if kiwoom else []
+                DAILY_STARTING_EQUITY = portfolio_equity_usd(
+                    usd_direct, opening_holdings
+                )
+            except Exception:
+                DAILY_STARTING_EQUITY = usd_direct
+            DAILY_START_DATE = today_ny
+
+        daily_starting_balance = DAILY_STARTING_EQUITY or usd_direct
+
+        if not IS_DRY_RUN:
+            breaker = get_circuit_breaker_status(daily_starting_balance)
+            if breaker["newly_blocked"]:
+                send_discord(
+                    f"🛑 [일일 서킷브레이커 발동] 신규 매수 중단: {breaker['reason']}"
+                )
+
+        candidates = (
+            get_rotating_us_candidates(
+                kiwoom,
+                max_price=min(available_usd, 50.0),
+                limit=12,
+            )
+            if kiwoom and available_usd > 0
+            else []
+        )
+        candidate_by_ticker = {item["ticker"]: item for item in candidates}
+        for ticker, position in active_positions.items():
+            candidate_by_ticker.setdefault(
+                ticker,
+                {
+                    "ticker": ticker,
+                    "exchange": position.get("exchange") or get_kiwoom_exchange_code(ticker),
+                },
+            )
+
+        for candidate in candidate_by_ticker.values():
+            ticker = candidate["ticker"]
+            try:
+                exchange_code = candidate.get("exchange") or get_kiwoom_exchange_code(ticker)
+                is_soxl_amex = ticker == "SOXL" and exchange_code == "AM"
+                if exchange_code != "ND" and not is_soxl_amex and ticker not in active_positions:
+                    print(f"⏭️ [NASDAQ 전용] {ticker} 매수 스캔 제외 (거래소: {exchange_code})")
+                    continue
+                if ticker not in active_positions and has_ticker_activity_today(ticker):
+                    print(f"⏸️ [당일 재진입 차단] {ticker}: 오늘 이미 주문했습니다.")
+                    continue
+
+                # 키움 미국주식 1분봉(usa06011)
+                candle_rows = kiwoom.get_us_stock_minute_chart(
+                    ticker, exchange=exchange_code, interval="1", max_pages=2
+                )
+                data = kiwoom_minute_rows_to_frame(candle_rows)
                 if data.empty or len(data) < 30:
                     continue
 
@@ -262,75 +404,71 @@ def real_trading_engine():
                 cur_price = ind["cur_price"]
 
                 # -------------------------------------------------------------
-                # CASE 1: 보유 중인 포지션 관리 -> 손절(-2.5%) / 맥시멈 상한(+30%) / 트레일링 스탑
+                # CASE 1: 보유 포지션을 공통 익절·손절 기준으로 관리
                 # -------------------------------------------------------------
                 if ticker in active_positions:
                     pos = active_positions[ticker]
                     buy_price = pos["buy_price"]
-
-                    # 최고가 실시간 갱신
-                    if cur_price > pos["highest_price"]:
-                        pos["highest_price"] = cur_price
-
-                    highest_price = pos["highest_price"]
                     profit_rate = ((cur_price - buy_price) / buy_price) * 100
-                    pullback_rate = ((cur_price - highest_price) / highest_price) * 100
-                    highest_profit = ((highest_price - buy_price) / buy_price) * 100
+                    position_key = f"api:{ticker}:{buy_price:.4f}:{pos['qty']}"
+                    take_profit_armed = is_take_profit_armed(position_key)
+                    if profit_rate >= TAKE_PROFIT_PCT:
+                        take_profit_armed = True
+                        if not IS_DRY_RUN:
+                            arm_take_profit(position_key)
 
-                    # 1) 원금 보호 기계적 손절 (-2.5% 이하)
-                    if profit_rate <= -2.5:
-                        print(f"🛑 [원금보호 손절] {ticker} | 실현수익률: {profit_rate:+.2f}%")
-                        order_status = "가상(Dry-Run)"
-                        if not IS_DRY_RUN and kiwoom:
-                            order_res = kiwoom.order_us_stock(ticker, "SELL", pos["qty"])
-                            order_status = order_res.get("return_msg", "접수완료")
+                    momentum_continues = bool(
+                        ind.get("momentum_continues", False)
+                    ) if take_profit_armed and profit_rate < MAX_TAKE_PROFIT_PCT else False
+                    exit_rule = get_exit_rule(
+                        profit_rate,
+                        momentum_continues=momentum_continues,
+                        take_profit_armed=take_profit_armed,
+                    )
 
-                        ai_report = fetch_real_news_and_ai_report(ticker, "SELL", cur_price)
-                        send_discord(
-                            f"🛑 **[원금 보호 손절 체결]**\n"
-                            f"• 종목: **{ticker}** | 청산단가: ${cur_price:.2f} ({pos['qty']}주)\n"
-                            f"• 실현손익: **{profit_rate:+.2f}%** | 주문상태: `{order_status}`\n"
-                            f"• 사유: 손절선(-2.5%) 터치에 따른 손실 고정 방어\n"
-                            f"────────────────────────\n"
-                            f"📰 **외신 AI 리포트**:\n{ai_report}"
+                    if exit_rule:
+                        exit_labels = {
+                            "STOP_LOSS": ("🛑", "손절", "손절 기준 -1.8% 도달"),
+                            "TAKE_PROFIT": ("🎉", "익절", "익절 기준 +3.5% 도달"),
+                            "MAX_TAKE_PROFIT": (
+                                "🚀",
+                                "최대 상한 익절",
+                                "최대 익절 기준 +7.0% 도달",
+                            ),
+                        }
+                        emoji, exit_name, exit_reason = exit_labels[exit_rule]
+                        print(
+                            f"{emoji} [{exit_name}] {ticker} | 수익률: {profit_rate:+.2f}%"
                         )
-                        del active_positions[ticker]
-                        continue
-
-                    # 2) 맥시멈 목표 상한선 도달 전량 익절 (+30.0% 이상)
-                    if profit_rate >= 30.0:
-                        print(f"🎉 [맥시멈 목표 달성] {ticker} | 실현수익률: {profit_rate:+.2f}%")
-                        order_status = "가상(Dry-Run)"
-                        if not IS_DRY_RUN and kiwoom:
-                            order_res = kiwoom.order_us_stock(ticker, "SELL", pos["qty"])
-                            order_status = order_res.get("return_msg", "접수완료")
-
-                        ai_report = fetch_real_news_and_ai_report(ticker, "SELL", cur_price)
-                        send_discord(
-                            f"🎉 **[최대 목표 달성 전량 익절]**\n"
-                            f"• 종목: **{ticker}** | 청산단가: ${cur_price:.2f} ({pos['qty']}주)\n"
-                            f"• **실현수익률: {profit_rate:+.2f}%** | 주문상태: `{order_status}`\n"
-                            f"• 사유: 설정된 최대 목표 수익률(+30%) 완벽 달성\n"
-                            f"────────────────────────\n"
-                            f"📰 **외신 AI 리포트**:\n{ai_report}"
+                        order_accepted, order_status = submit_us_stock_order(
+                            ticker, "SELL", pos["qty"], cur_price, exchange_code
                         )
-                        del active_positions[ticker]
-                        continue
+                        if not order_accepted:
+                            print(f"❌ [{exit_name} 매도 주문 실패] {ticker}: {order_status}")
+                            continue
+                        clear_position_exit_state(position_key)
 
-                    # 3) 트레일링 스탑 익절 (+4.0% 이상 도달 후 최고점 대비 -2.5% 되돌림 시)
-                    if highest_profit >= 4.0 and pullback_rate <= -2.5:
-                        print(f"🎯 [트레일링 익절] {ticker} | 최고점: +{highest_profit:.2f}% -> 확정: {profit_rate:+.2f}%")
-                        order_status = "가상(Dry-Run)"
-                        if not IS_DRY_RUN and kiwoom:
-                            order_res = kiwoom.order_us_stock(ticker, "SELL", pos["qty"])
-                            order_status = order_res.get("return_msg", "접수완료")
+                        if exit_rule == "STOP_LOSS" and not IS_DRY_RUN:
+                            breaker = record_stop_loss(
+                                position_key=f"api:{ticker}:{buy_price:.4f}:{pos['qty']}",
+                                estimated_loss=max(
+                                    0.0, (buy_price - cur_price) * pos["qty"]
+                                ),
+                                starting_balance=daily_starting_balance,
+                            )
+                            if breaker["newly_blocked"]:
+                                send_discord(
+                                    f"🛑 [일일 서킷브레이커 발동] 신규 매수 중단: {breaker['reason']}"
+                                )
 
-                        ai_report = fetch_real_news_and_ai_report(ticker, "SELL", cur_price)
+                        ai_report = fetch_real_news_and_ai_report(
+                            ticker, "SELL", cur_price
+                        )
                         send_discord(
-                            f"🔔 **[트레일링 스탑 수익 보존 청산]**\n"
-                            f"• 종목: **{ticker}** | 청산단가: ${cur_price:.2f} ({pos['qty']}주)\n"
-                            f"• 최고점: +{highest_profit:.2f}% | **최종 실현수익률: {profit_rate:+.2f}%**\n"
-                            f"• 사유: 최고점 대비 -2.5% 꺾임 발생 (수익 확정)\n"
+                            f"{emoji} **[{exit_name} 주문 접수]**\n"
+                            f"• 종목: **{ticker}** | 주문기준가: ${cur_price:.2f} ({pos['qty']}주)\n"
+                            f"• 수익률: **{profit_rate:+.2f}%** | 주문상태: `{order_status}`\n"
+                            f"• 사유: {exit_reason}\n"
                             f"────────────────────────\n"
                             f"📰 **외신 AI 리포트**:\n{ai_report}"
                         )
@@ -342,6 +480,23 @@ def real_trading_engine():
                 # -------------------------------------------------------------
                 # CASE 2: 미보유 상태 -> 1분봉 5중 복합 퀀트 지표 동시 검증
                 # -------------------------------------------------------------
+                if is_new_entry_cutoff_time():
+                    continue
+
+                breaker = get_circuit_breaker_status(daily_starting_balance)
+                if breaker["newly_blocked"]:
+                    send_discord(
+                        f"🛑 [일일 서킷브레이커 발동] 신규 매수 중단: {breaker['reason']}"
+                    )
+                if breaker["blocked"]:
+                    print(f"🛑 [일일 서킷브레이커] 신규 매수 차단: {breaker['reason']}")
+                    continue
+
+                market_ok, market_reason = market_trend_allows_entries(kiwoom)
+                if not market_ok:
+                    print(f"📉 [시장 장세 필터] 신규 매수 차단: {market_reason}")
+                    continue
+
                 if cur_price > available_usd or cur_price < 1.0:
                     continue
 
@@ -350,37 +505,41 @@ def real_trading_engine():
                 cond_obv = ind["obv"] > ind["obv_ma"]                        # 2. OBV 추세선 상회 (자금 유입)
                 cond_adx = (ind["adx"] >= 25.0) and (ind["plus_di"] > ind["minus_di"])  # 3. ADX 강추세 + 매수우위
                 cond_ma = ind["ma5"] > ind["ma20"]                           # 4. 단기 이평선 정배열
-                cond_vol = (ind["avg_vol"] > 0) and (ind["cur_vol"] >= ind["avg_vol"] * 2.5) # 5. 1분 거래량 2.5배 폭증
+                volume_ratio = ind["cur_vol"] / ind["avg_vol"] if ind["avg_vol"] > 0 else 0.0
+                cond_vol = 3.0 <= volume_ratio <= 5.0 # 5. 완료봉 평균 대비 3~5배 거래량
 
                 # 5개 조건이 완벽히 동시 충족될 때만 진입
                 if cond_vwap and cond_obv and cond_adx and cond_ma and cond_vol:
-                    vol_ratio = ind["cur_vol"] / ind["avg_vol"]
+                    vol_ratio = volume_ratio
                     
                     # 1회 매수 수량 계산 (1회당 최대 약 $35 한도 내에서 주수 결정, 최소 1주)
                     target_budget = min(available_usd * 0.3, 35.0)
-                    buy_qty = max(1, int(target_budget // cur_price))
+                    buy_qty = min(5, max(1, int(target_budget // cur_price)))
 
                     if (cur_price * buy_qty) > available_usd:
                         buy_qty = 1
 
                     print(f"🚀 [5중 검증 급등 포착] {ticker} | 단가: ${cur_price:.2f} ({buy_qty}주) | ADX: {ind['adx']:.1f} | 거래량: {vol_ratio:.1f}배")
 
-                    order_status = "가상(Dry-Run)"
-                    if not IS_DRY_RUN and kiwoom:
-                        order_res = kiwoom.order_us_stock(ticker, "BUY", buy_qty)
-                        order_status = order_res.get("return_msg", "접수완료")
+                    order_accepted, order_status = submit_us_stock_order(
+                        ticker, "BUY", buy_qty, cur_price, exchange_code
+                    )
+                    if not order_accepted:
+                        print(f"❌ [매수 주문 실패] {ticker}: {order_status}")
+                        continue
 
                     active_positions[ticker] = {
                         "buy_price": cur_price,
                         "qty": buy_qty,
-                        "highest_price": cur_price
+                        "highest_price": cur_price,
+                        "exchange": exchange_code,
                     }
 
                     ai_report = fetch_real_news_and_ai_report(ticker, "BUY", cur_price)
 
                     msg = (
-                        f"⚡ **[1분봉 5중 복합 퀀트 매수 체결]** {ticker}\n"
-                        f"• 체결단가: **${cur_price:.2f}** ({buy_qty}주) | 주문상태: `{order_status}`\n"
+                        f"⚡ **[1분봉 5중 복합 퀀트 매수 주문 접수]** {ticker}\n"
+                        f"• 주문기준가: **${cur_price:.2f}** ({buy_qty}주) | 주문상태: `{order_status}`\n"
                         f"• **지표 검증 통과**:\n"
                         f"  - VWAP 돌파: ${cur_price:.2f} > ${ind['vwap']:.2f}\n"
                         f"  - ADX 추세강도: {ind['adx']:.1f} (상승 탄력 돌입)\n"
@@ -474,14 +633,30 @@ def get_account_details():
                 "profit_rate": round(profit_rate, 2),
             })
 
-      # 총 투자 원금 대비 수익률 계산
+        # 보유주 미실현손익과 계좌 전체 추적 손익을 분리
         total_cost = total_eval_usd - total_profit_usd
         total_profit_rate = round((total_profit_usd / total_cost * 100), 2) if total_cost > 0 else 0.0
+        usd_deposit = safe_float(dep.get("usd_deposit", 0.0))
+        account_equity_usd = round(usd_deposit + total_eval_usd, 2)
+        account_baseline = get_or_create_account_baseline(account_equity_usd)
+        account_profit_usd = round(
+            account_equity_usd - account_baseline["equity_usd"], 2
+        )
+        account_profit_rate = (
+            round(account_profit_usd / account_baseline["equity_usd"] * 100, 2)
+            if account_baseline["equity_usd"] > 0
+            else 0.0
+        )
 
         return {
             "account_no": kiwoom.full_account_no,
             "krw_deposit": dep.get("krw_deposit", 0.0),
-            "usd_deposit": dep.get("usd_deposit", 0.0),
+            "usd_deposit": usd_deposit,
+            "account_equity_usd": account_equity_usd,
+            "account_baseline_usd": account_baseline["equity_usd"],
+            "account_baseline_date": account_baseline["date"],
+            "account_profit_usd": account_profit_usd,
+            "account_profit_rate": account_profit_rate,
             
             # 총 평가금액 필드 매핑
             "total_eval_usd": round(total_eval_usd, 2),
@@ -513,6 +688,11 @@ def get_account_details():
             "account_no": getattr(kiwoom, "full_account_no", ""),
             "krw_deposit": 0.0,
             "usd_deposit": 0.0,
+            "account_equity_usd": 0.0,
+            "account_baseline_usd": 0.0,
+            "account_baseline_date": "",
+            "account_profit_usd": 0.0,
+            "account_profit_rate": 0.0,
             "total_eval_usd": 0.0,
             "total_profit_usd": 0.0,
             "total_profit_rate": 0.0,
@@ -534,41 +714,100 @@ def search_all_stocks(q: str = Query("", min_length=1)):
 
 @app.get("/api/candles/{ticker}")
 def get_candles(ticker: str, timeframe: str = Query("1D")):
-    tf_map = {
-        "1m": ("1d", "1m"),
-        "10m": ("5d", "5m"),
-        "30m": ("1mo", "30m"),
-        "1h": ("1mo", "1h"),
-        "3h": ("3mo", "1h"),
-        "1D": ("6mo", "1d"),
-        "1W": ("1y", "1wk"),
-        "1M": ("2y", "1mo")
-    }
-    period, interval = tf_map.get(timeframe, ("6mo", "1d"))
-
     try:
-        data = yf.download(ticker.upper(), period=period, interval=interval, progress=False, auto_adjust=True)
-        if data.empty:
+        normalized_ticker = ticker.upper().strip()
+        exchange = get_kiwoom_exchange_code(normalized_ticker)
+        if exchange not in {"ND", "NY", "AM"}:
+            raise HTTPException(status_code=404, detail="키움 거래소 정보를 찾을 수 없습니다.")
+
+        today_ny = datetime.now(pytz.timezone("America/New_York")).date()
+        chart_configs = {
+            "1m": ("minute", "1", 1),
+            "10m": ("minute", "10", 5),
+            "30m": ("minute", "30", 30),
+            "1h": ("minute", "60", 90),
+            "3h": ("minute", "60", 90),
+            "1D": ("D", "", 180),
+            "1W": ("W", "", 730),
+            "1M": ("M", "", 1825),
+        }
+        chart_type, interval, lookback_days = chart_configs.get(
+            timeframe, chart_configs["1D"]
+        )
+        start_date = (today_ny - pd.Timedelta(days=lookback_days)).strftime("%Y%m%d")
+
+        if chart_type == "minute":
+            rows = kiwoom.get_us_stock_minute_chart(
+                normalized_ticker,
+                exchange=exchange,
+                interval=interval,
+                start_date=start_date,
+                max_pages=5,
+            )
+        else:
+            rows = kiwoom.get_us_stock_period_chart(
+                normalized_ticker,
+                exchange=exchange,
+                period=chart_type,
+                start_date=start_date,
+                max_pages=5,
+            )
+
+        if not rows:
             raise HTTPException(status_code=404, detail="시세 데이터가 없습니다.")
 
-        close = data["Close"].iloc[:, 0] if isinstance(data.columns, pd.MultiIndex) else data["Close"]
-        open_p = data["Open"].iloc[:, 0] if isinstance(data.columns, pd.MultiIndex) else data["Open"]
-        high = data["High"].iloc[:, 0] if isinstance(data.columns, pd.MultiIndex) else data["High"]
-        low = data["Low"].iloc[:, 0] if isinstance(data.columns, pd.MultiIndex) else data["Low"]
-        volume = data["Volume"].iloc[:, 0] if isinstance(data.columns, pd.MultiIndex) else data["Volume"]
-
         candles = []
-        for i in range(len(data)):
-            idx = data.index[i]
-            t_val = int(idx.timestamp()) if interval in ["1m", "5m", "15m", "30m", "1h"] else idx.strftime("%Y-%m-%d")
+        for row in rows:
+            date_text = str(row.get("dt") or row.get("bus_dt") or row.get("cntr_tm") or "")
+            if not date_text:
+                continue
+
+            try:
+                if chart_type == "minute":
+                    timestamp_text = str(row.get("cntr_tm") or date_text)
+                    timestamp_dt = datetime.strptime(timestamp_text[:14], "%Y%m%d%H%M%S")
+                    timestamp_dt = pytz.timezone("America/New_York").localize(timestamp_dt)
+                    t_val = int(timestamp_dt.timestamp())
+                else:
+                    day_text = str(row.get("dt") or row.get("bus_dt") or date_text)[:8]
+                    t_val = f"{day_text[:4]}-{day_text[4:6]}-{day_text[6:8]}"
+                open_price = safe_float(row.get("open_pric"))
+                high_price = safe_float(row.get("high_pric"))
+                low_price = safe_float(row.get("low_pric"))
+                close_price = safe_float(row.get("cur_prc"))
+                volume = int(safe_float(row.get("trde_qty") or row.get("acc_trde_qty")))
+            except (TypeError, ValueError):
+                continue
+            if min(open_price, high_price, low_price, close_price) <= 0:
+                continue
             candles.append({
                 "time": t_val,
-                "open": round(float(open_p.iloc[i]), 2),
-                "high": round(float(high.iloc[i]), 2),
-                "low": round(float(low.iloc[i]), 2),
-                "close": round(float(close.iloc[i]), 2),
-                "volume": int(volume.iloc[i])
+                "open": round(open_price, 2),
+                "high": round(high_price, 2),
+                "low": round(low_price, 2),
+                "close": round(close_price, 2),
+                "volume": max(0, volume),
             })
-        return {"ticker": ticker.upper(), "candles": candles}
+
+        if timeframe == "3h":
+            grouped = []
+            for index in range(0, len(candles), 3):
+                chunk = candles[index : index + 3]
+                if len(chunk) < 3:
+                    continue
+                grouped.append({
+                    "time": chunk[0]["time"],
+                    "open": chunk[0]["open"],
+                    "high": max(candle["high"] for candle in chunk),
+                    "low": min(candle["low"] for candle in chunk),
+                    "close": chunk[-1]["close"],
+                    "volume": sum(candle["volume"] for candle in chunk),
+                })
+            candles = grouped
+
+        candles.sort(key=lambda candle: candle["time"])
+        return {"ticker": normalized_ticker, "candles": candles}
     except Exception as e:
+        if isinstance(e, HTTPException):
+            raise
         raise HTTPException(status_code=500, detail=str(e))
