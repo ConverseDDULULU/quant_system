@@ -56,6 +56,8 @@ from src.kiwoom_client import KiwoomClient
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 
+BUY_EXCHANGES = {"ND", "NY"}  # 신규 매수 허용 거래소 (NASDAQ, NYSE)
+
 # 익절·손절·수량 등 매매 조건 (data/strategy_params.json, 거래일마다 다시 읽음)
 PARAMS = strategy_params.apply_to_engine()
 
@@ -513,10 +515,11 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
         )
 
         if sig == "BUY":
+            # 매수 허용 거래소: NASDAQ·NYSE 주식 (AMEX(NA)는 SOXL만). kiwoom_client.order_us_stock과 같은 기준
             is_soxl_amex = ticker == "SOXL" and exchange_code == "NA"
-            if exchange_code != "ND" and not is_soxl_amex:
+            if exchange_code not in BUY_EXCHANGES and not is_soxl_amex:
                 print(
-                    f"   ⏭️ [NASDAQ 전용] {ticker} 매수 차단 (거래소: {exchange_code})"
+                    f"   ⏭️ [거래소 제한] {ticker} 매수 차단 (거래소: {exchange_code})"
                 )
                 continue
 
