@@ -1,0 +1,13 @@
+[Unit]
+Description=Claude post-close review and strategy tuning
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=__APP_USER__
+WorkingDirectory=__APP_DIR__
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+ExecStart=/usr/bin/bash __APP_DIR__/deploy/run_claude_review.sh
+TimeoutStartSec=45min

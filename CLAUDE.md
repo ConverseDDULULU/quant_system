@@ -22,6 +22,8 @@
 
 담당이 애매한 파일은 지금 그 파일을 고치고 있는 세션에 먼저 물어봐요.
 
+서버에서는 평일 장마감 뒤 **서버 Claude**(`claude-review.timer`, 지시문 `deploy/claude_review_prompt.md`)가 자동으로 돌아요. 수치는 `strategy_params`로, 매수 조건은 `get_bottom_reversal_signal()` 안에서만 바꾸고, 직접 push하고 서버에 반영해요. 서버 Claude의 커밋 작성자는 `quant-server (Claude)`예요. 작업 전 `git pull`을 꼭 해 주세요.
+
 ## 협업 규칙
 1. **작업 전에 `git pull --ff-only origin main`**, 커밋 뒤에는 `git pull --rebase`로 최신 위에 올려요.
 2. 커밋하면 **1번 세션에 커밋 해시와 바꾼 파일을 메시지로** 알려요. push는 사용자가 승인했을 때만 해요.

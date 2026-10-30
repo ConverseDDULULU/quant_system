@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Claude review after US market close
+
+[Timer]
+# 뉴욕 장마감(16:00) 1시간 30분 뒤, 평일. 휴장일은 스크립트가 건너뜀
+OnCalendar=Mon..Fri 17:30 America/New_York
+Persistent=true
+
+[Install]
+WantedBy=timers.target

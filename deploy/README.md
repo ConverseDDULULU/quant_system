@@ -71,6 +71,30 @@ gcloud compute ssh <VM이름> --zone asia-northeast3-a -- -L 8000:localhost:8000
 
 이 창을 켜둔 채로 로컬에서 `frontend` 폴더의 `npm run dev`를 실행하면 됩니다.
 
+## 7. 장마감 Claude 분석 자동 실행 (PC 없이)
+
+평일 뉴욕 17:30(장마감 1시간 30분 뒤)에 서버가 Claude Code를 실행해 그날 매매를 분석하고, 익절·손절 수치와 매수 조건을 조정해 반영한 뒤 디스코드로 알려요. 지시문은 [claude_review_prompt.md](claude_review_prompt.md)에 있어요.
+
+1. **Claude Code 설치** (서버에서 한 번):
+   ```bash
+   gcloud compute ssh quant-server --zone asia-northeast3-a --command "curl -fsSL https://claude.ai/install.sh | bash"
+   ```
+2. **인증 파일 만들기**: 서버의 `~/.config/quant/claude.env`에 둘 중 하나를 넣어요.
+   - API 키(사용량만큼 과금): `ANTHROPIC_API_KEY=sk-ant-...`
+   - Claude 구독 사용: 서버에서 `claude setup-token`을 실행해 받은 토큰을 `CLAUDE_CODE_OAUTH_TOKEN=...`으로
+3. **설정 스크립트 실행**:
+   ```bash
+   gcloud compute ssh quant-server --zone asia-northeast3-a --command "cd quant_system && bash deploy/setup_claude_review.sh"
+   ```
+   마지막에 출력되는 공개키를 GitHub 저장소 **Settings → Deploy keys → Add deploy key**에 **Allow write access**를 체크해서 등록하세요.
+4. **바로 시험해 보기**: `sudo systemctl start claude-review.service` 후 `ls ~/quant_system/logs/claude_review/`에서 로그를 확인해요.
+
+| 하고 싶은 것 | 명령 (서버) |
+|---|---|
+| 다음 실행 시각 | `systemctl list-timers claude-review.timer` |
+| 자동 분석 끄기 | `sudo systemctl disable --now claude-review.timer` |
+| 수치 변경 되돌리기 | `cd quant_system && PYTHONPATH=src:. .venv/bin/python src/strategy_params.py rollback` |
+
 ## ⚠️ 주의
 
 - **로컬 PC와 서버에서 동시에 엔진을 켜지 마세요.** 같은 계좌로 주문이 두 번 나갑니다. 서버 가동 후에는 `run_all.bat`의 매매 엔진(3번)을 실행하지 마세요.
