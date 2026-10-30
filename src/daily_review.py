@@ -366,6 +366,13 @@ def run_daily_review(day, discord_sender=None) -> str:
     print(report)
     if discord_sender:
         _send_chunks(report, discord_sender)
+        try:
+            # 함수 안에서 import: matplotlib이 없어도 리뷰와 스케줄러(이 모듈을 import)는 계속 돈다
+            import report_charts
+
+            report_charts.send_daily_chart(day, trades, market)
+        except Exception as e:
+            print(f"⚠️ 일일 리뷰 그래프 생략: {e}")
     return report
 
 
