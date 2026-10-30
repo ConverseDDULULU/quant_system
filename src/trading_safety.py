@@ -192,11 +192,12 @@ def kiwoom_minute_rows_to_frame(rows: list) -> pd.DataFrame:
 def get_rotating_us_candidates(
     client, max_price: float = 50.0, limit: int = 12
 ) -> list[dict]:
-    # 후보 원천: 전체 거래소 거래량 상위(usa20530) + 상승률 상위(usa20910, 거래대금 100만$ 이상)
+    # 후보 원천: 전체 거래소 거래량 상위(usa20530, 1페이지) + 상승률 상위(usa20910, 거래대금 100만$ 이상, 3페이지)
+    # 상승률 1페이지는 +10% 넘는 폭등주라 0.5~15% 필터를 거의 못 통과해 3페이지(약 +4%대)까지 본다
     ranked_rows = []
     sources = (
         ("거래량 상위", lambda: client.get_us_today_volume_top(exchange="0", max_pages=1)),
-        ("상승률 상위", lambda: client.get_us_top_gainers(exchange="0", max_pages=1)),
+        ("상승률 상위", lambda: client.get_us_top_gainers(exchange="0", max_pages=3)),
     )
     for label, fetch in sources:
         try:
