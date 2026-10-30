@@ -192,28 +192,38 @@ def kiwoom_minute_rows_to_frame(rows: list) -> pd.DataFrame:
 def get_rotating_us_candidates(
     client, max_price: float = 50.0, limit: int = 12
 ) -> list[dict]:
+    # 후보 원천: 전체 거래소 거래량 상위(usa20530) + 상승률 상위(usa20910, 거래대금 100만$ 이상)
     ranked_rows = []
-    for market_type in ("2", "3"):
+    sources = (
+        ("거래량 상위", lambda: client.get_us_today_volume_top(exchange="0", max_pages=1)),
+        ("상승률 상위", lambda: client.get_us_top_gainers(exchange="0", max_pages=1)),
+    )
+    for label, fetch in sources:
         try:
-            ranked_rows.extend(
-                client.get_us_today_volume_top(exchange=market_type, max_pages=1)
-            )
+            ranked_rows.extend(fetch())
         except Exception as exc:
-            print(f"⚠️ 키움 거래량 순위 조회 실패({market_type}): {exc}")
+            print(f"⚠️ 키움 {label} 조회 실패: {exc}")
+
+    def _num(value) -> float:
+        return float(str(value if value is not None else "0").replace(",", "").replace("+", ""))
 
     unique = {}
     for row in ranked_rows:
         ticker = str(row.get("stk_cd", "")).strip().upper()
         exchange = str(row.get("stex_tp", "")).strip().upper()
-        if not ticker or (exchange != "ND" and not (ticker == "SOXL" and exchange == "NA")):
+        # 매수 허용 거래소: NASDAQ·NYSE, AMEX는 SOXL만 (kiwoom_client.order_us_stock과 같은 기준)
+        if not ticker or (exchange not in ("ND", "NY") and not (ticker == "SOXL" and exchange == "NA")):
             continue
         try:
-            price = float(str(row.get("cur_prc", "0")).replace(",", "").replace("+", ""))
-            volume = int(float(str(row.get("acc_trde_qty", "0")).replace(",", "").replace("+", "")))
-            change_pct = float(str(row.get("flu_rt", "0")).replace(",", "").replace("+", ""))
+            # cur_prc·거래량은 등락 부호가 붙어 올 수 있어 절댓값, 등락률은 부호 유지
+            price = abs(_num(row.get("cur_prc")))
+            volume = int(abs(_num(row.get("acc_trde_qty") or row.get("trde_qty"))))
+            change_pct = _num(row.get("flu_rt"))
         except (TypeError, ValueError):
             continue
         if not (1.0 <= price <= max_price and volume > 0 and 0.5 <= change_pct <= 15.0):
+            continue
+        if ticker in unique and unique[ticker]["volume"] >= volume:
             continue
         unique[ticker] = {
             "ticker": ticker,

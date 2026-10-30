@@ -45,8 +45,8 @@ class KiwoomClient:
         self.base_url = "https://api.kiwoom.com"
         self._us_stock_master_cache = {}
         self._us_stock_master_cache_time = {}
-        self._us_volume_top_cache = {}
-        self._us_volume_top_cache_time = {}
+        self._us_rank_cache = {}
+        self._us_rank_cache_time = {}
         self._us_minute_chart_cache = {}
         self._us_minute_chart_cache_time = {}
 
@@ -290,13 +290,12 @@ class KiwoomClient:
             return {}
         return data
 
-    def get_us_today_volume_top(
-        self, exchange: str = "2", max_pages: int = 5, refresh: bool = False
+    def _get_us_rank_rows(
+        self, api_id: str, body: dict, cache_key: tuple, max_pages: int, refresh: bool
     ) -> list:
-        """키움 미국주식 당일 거래량 상위(usa20530)를 조회한다."""
-        exchange = str(exchange)
-        cached = self._us_volume_top_cache.get(exchange)
-        cached_at = self._us_volume_top_cache_time.get(exchange, 0.0)
+        """/api/us/rkinfo 순위 조회 공통 (연속조회, 30초 캐시)"""
+        cached = self._us_rank_cache.get(cache_key)
+        cached_at = self._us_rank_cache_time.get(cache_key, 0.0)
         if cached and not refresh and time.monotonic() - cached_at < 30:
             return list(cached)
 
@@ -308,17 +307,7 @@ class KiwoomClient:
         headers = {
             "Content-Type": "application/json;charset=UTF-8",
             "authorization": f"Bearer {self.access_token}",
-            "api-id": "usa20530",
-        }
-        body = {
-            "stex_tp": str(exchange),
-            "inds_cd": "",
-            "stk_tp": "1",
-            "trde_qty_tp": "0",
-            "qry_tp": "0",
-            "stk_cnd": "0",
-            "pric_cnd": "0",
-            "trde_prica_cnd": "0",
+            "api-id": api_id,
         }
 
         for _ in range(max_pages):
@@ -335,12 +324,12 @@ class KiwoomClient:
                 )
                 data = response.json()
             except Exception as exc:
-                print(f"⚠️ 키움 미국 거래량 상위 조회 실패: {exc}")
+                print(f"⚠️ 키움 미국 순위 조회 실패({api_id}): {exc}")
                 break
 
             if str(data.get("return_code", "0")) != "0":
                 print(
-                    "⚠️ 키움 미국 거래량 상위 오류: "
+                    f"⚠️ 키움 미국 순위 오류({api_id}): "
                     f"[{data.get('return_code')}] {data.get('return_msg', '응답 없음')}"
                 )
                 break
@@ -359,9 +348,57 @@ class KiwoomClient:
             time.sleep(0.2)
 
         if rows:
-            self._us_volume_top_cache[exchange] = rows
-            self._us_volume_top_cache_time[exchange] = time.monotonic()
+            self._us_rank_cache[cache_key] = rows
+            self._us_rank_cache_time[cache_key] = time.monotonic()
         return rows
+
+    def get_us_today_volume_top(
+        self, exchange: str = "2", max_pages: int = 5, refresh: bool = False
+    ) -> list:
+        """키움 미국주식 당일 거래량 상위(usa20530)를 조회한다. 거래량 키: acc_trde_qty"""
+        exchange = str(exchange)
+        body = {
+            "stex_tp": exchange,
+            "inds_cd": "",
+            "stk_tp": "1",
+            "trde_qty_tp": "0",
+            "qry_tp": "0",
+            "stk_cnd": "0",
+            "pric_cnd": "0",
+            "trde_prica_cnd": "0",
+        }
+        return self._get_us_rank_rows(
+            "usa20530", body, ("usa20530", exchange), max_pages, refresh
+        )
+
+    def get_us_top_gainers(
+        self,
+        exchange: str = "0",
+        min_trade_value: str = "100",
+        max_pages: int = 1,
+        refresh: bool = False,
+    ) -> list:
+        """키움 미국주식 전일대비 등락률 상위(usa20910, 상승률순)를 조회한다.
+
+        exchange: 0 전체, 1 NYSE, 2 NASDAQ, 3 AMEX
+        min_trade_value: 거래대금 하한(USD 1만 단위, "100"=100만 달러 이상)
+        응답의 거래량 키는 trde_qty (usa20530의 acc_trde_qty와 다름)
+        """
+        exchange = str(exchange)
+        body = {
+            "stex_tp": exchange,
+            "inds_cd": "000",
+            "inds_cls_tp": "0",
+            "sort_tp": "1",
+            "stk_tp": "1",
+            "stk_cnd": "0",
+            "pric_cnd": "0",
+            "trde_prica_cnd": str(min_trade_value),
+            "trde_qty_tp": "0",
+        }
+        return self._get_us_rank_rows(
+            "usa20910", body, ("usa20910", exchange, str(min_trade_value)), max_pages, refresh
+        )
 
     def _get_us_stock_chart_rows(
         self,
@@ -561,10 +598,10 @@ class KiwoomClient:
                 "return_msg": f"거래소 확인 불가로 주문을 차단했습니다: {ticker} ({exchange_code or 'UNKNOWN'})",
             }
         is_soxl_amex = ticker.upper().strip() == "SOXL" and exchange_code == "NA"
-        if is_buy and exchange_code != "ND" and not is_soxl_amex:
+        if is_buy and exchange_code not in {"ND", "NY"} and not is_soxl_amex:
             return {
                 "return_code": -1,
-                "return_msg": f"NASDAQ 또는 SOXL(NA)만 매수할 수 있습니다: {ticker} (거래소 {exchange_code})",
+                "return_msg": f"NASDAQ·NYSE 또는 SOXL(NA)만 매수할 수 있습니다: {ticker} (거래소 {exchange_code})",
             }
 
         self._ensure_token()
