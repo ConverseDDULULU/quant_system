@@ -28,6 +28,8 @@ from trading_safety import (
     is_aggressive_entry_mode,
     is_take_profit_armed,
     market_trend_allows_entries,
+    max_position_qty,
+    position_budget_usd,
     kiwoom_minute_rows_to_frame,
     account_equity_usd,
     record_ticker_sell,
@@ -472,8 +474,9 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
         )
         return
 
-    # [안전장치 2] 1종목 몰빵 방지: 예수금이 많아도 1회 진입 단가는 최대 $50 이하로 제한
-    max_entry_price = min(usd_available, 50.0)
+    # [안전장치 2] 1종목 몰빵 방지: 진입 단가 $50 이하, 한 종목 매수 금액은 당일 시작 평가액의 1/2 이하
+    position_budget = position_budget_usd(INITIAL_BALANCE or usd_available, usd_available)
+    max_entry_price = min(position_budget, 50.0)
 
     target_stocks = get_pre_breakout_stocks(
         client, max_price=max_entry_price, limit=12
@@ -536,10 +539,16 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
                     )
                     continue
 
-                buy_qty = min(PARAMS["max_buy_qty"], int(usd_available / numeric_price))
+                buy_qty = max_position_qty(
+                    numeric_price,
+                    INITIAL_BALANCE or usd_available,
+                    usd_available,
+                    PARAMS["max_buy_qty"],
+                )
                 if buy_qty <= 0:
                     print(
-                        f"   ⚠️ [주문 스킵] {ticker} 단가(${numeric_price:.2f})가 잔여 예수금(${usd_available:.2f})보다 큽니다."
+                        f"   ⚠️ [주문 스킵] {ticker} 단가(${numeric_price:.2f})가 한 종목 예산"
+                        f"(${position_budget_usd(INITIAL_BALANCE or usd_available, usd_available):.2f})보다 큽니다."
                     )
                     continue
 

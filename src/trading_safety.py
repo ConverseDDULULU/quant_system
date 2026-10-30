@@ -20,6 +20,7 @@ MARKET_CACHE_SECONDS = 300
 STOP_LOSS_PCT = -1.8
 TAKE_PROFIT_PCT = 3.5
 MAX_TAKE_PROFIT_PCT = 7.0
+MAX_POSITION_FRACTION = 0.5  # 한 종목 매수 금액 상한: 계좌 평가액의 1/2
 KNOWN_EXCHANGE_CODES = {"GRAB": "ND", "RIOT": "ND", "SOXL": "NA"}
 
 _market_cache_lock = threading.Lock()
@@ -360,6 +361,25 @@ def clear_position_exit_state(position_key: str) -> None:
             "DELETE FROM position_exit_state WHERE position_key = ?",
             (position_key,),
         )
+
+
+def position_budget_usd(account_equity: float, cash_available: float) -> float:
+    """한 종목에 쓸 수 있는 최대 금액: 현금과 계좌 평가액 x MAX_POSITION_FRACTION 중 작은 값"""
+    cash = max(0.0, float(cash_available or 0.0))
+    equity = float(account_equity or 0.0)
+    if equity <= 0:
+        return cash
+    return min(cash, equity * MAX_POSITION_FRACTION)
+
+
+def max_position_qty(
+    price: float, account_equity: float, cash_available: float, max_qty: int
+) -> int:
+    """한 종목 매수 수량: 최대 수량과 한 종목 예산(position_budget_usd)으로 살 수 있는 수량 중 작은 값"""
+    if price <= 0:
+        return 0
+    budget = position_budget_usd(account_equity, cash_available)
+    return max(0, min(int(max_qty), int(budget / price)))
 
 
 def get_exit_rule(
