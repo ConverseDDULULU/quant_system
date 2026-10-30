@@ -6,6 +6,7 @@
 """
 
 import os
+import time
 
 import requests
 
@@ -19,15 +20,20 @@ def generate_text(prompt: str, temperature: float = 0.3, timeout: float = 30) ->
         return None
     model = os.getenv("GEMINI_MODEL", "").strip() or DEFAULT_MODEL
     try:
-        res = requests.post(
-            API_URL.format(model=model),
-            headers={"x-goog-api-key": api_key},
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": temperature},
-            },
-            timeout=timeout,
-        )
+        for attempt in range(2):
+            res = requests.post(
+                API_URL.format(model=model),
+                headers={"x-goog-api-key": api_key},
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": temperature},
+                },
+                timeout=timeout,
+            )
+            # 일시적 과부하(429/503)는 한 번만 잠깐 쉬고 재시도
+            if res.status_code not in (429, 503) or attempt == 1:
+                break
+            time.sleep(3)
         if res.status_code != 200:
             try:
                 message = res.json()["error"]["message"]

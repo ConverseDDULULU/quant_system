@@ -9,6 +9,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 import warnings
 import pytz
+import bear_mode
 import daily_review
 import strategy_params
 import trading_safety
@@ -462,12 +463,21 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
         print(f"🛑 [일일 서킷브레이커] 신규 매수 차단: {breaker['reason']}")
         return
 
+    MAX_HOLDINGS = PARAMS["max_holdings"]
+
+    # 하락장 대응: 하락 추세 + 악재 확인 시 일반 매수 대신 1배 인버스 ETF 진입 (bear_mode.py)
+    if bear_mode.is_enabled():
+        is_bear, bear_reason = bear_mode.detect_bear_market(client)
+        if is_bear:
+            print(f"🐻 [하락장 감지] {bear_reason}")
+            try_inverse_entry(client, held_tickers, usd_available, MAX_HOLDINGS, bear_reason, dry_run)
+            return
+
     market_ok, market_reason = market_trend_allows_entries(client)
     if not market_ok:
         print(f"📉 [시장 장세 필터] 신규 매수 차단: {market_reason}")
         return
 
-    MAX_HOLDINGS = PARAMS["max_holdings"]
     if len(held_tickers) >= MAX_HOLDINGS:
         print(
             f"\n🔒 [보유 슬롯 만석] 현재 {len(held_tickers)}/{MAX_HOLDINGS} 종목 보유 중으로 신규 매수를 대기합니다."
@@ -581,6 +591,57 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
                 else:
                     finish_ticker_buy(ticker, accepted=False)
                 time.sleep(2)
+
+
+def try_inverse_entry(client, held_tickers, usd_available, max_holdings, bear_reason, dry_run):
+    """하락장에서 1배 인버스 ETF를 한 종목만 매수 (악재 확인·상승 탄력·종목당 예산 적용)"""
+    inverse_tickers = {t for t, _ in bear_mode.INVERSE_ETFS}
+    if inverse_tickers & set(held_tickers):
+        print("   🐻 [하락장 대응] 이미 인버스 ETF 보유 중, 추가 매수 안 함")
+        return
+    if len(held_tickers) >= max_holdings:
+        print(f"   🐻 [하락장 대응] 보유 슬롯 만석 ({len(held_tickers)}/{max_holdings})")
+        return
+
+    news_bad, news_reason = bear_mode.confirm_bad_news()
+    if not news_bad:
+        print(f"   🐻 [하락장 대응] 악재 미확인으로 진입 보류: {news_reason}")
+        return
+
+    pick = bear_mode.pick_inverse_etf(
+        client, exclude={t for t in inverse_tickers if has_ticker_activity_today(t)}
+    )
+    if not pick:
+        return
+    ticker, exchange_code = pick["ticker"], pick["exchange"]
+    numeric_price = format_us_price(pick["price"])
+    budget = position_budget_usd(INITIAL_BALANCE or usd_available, usd_available)
+    buy_qty = max_position_qty(numeric_price, INITIAL_BALANCE or usd_available, usd_available, PARAMS["max_buy_qty"])
+    print(f"   🐻 [하락장 대응] {ticker} ${numeric_price:.2f} x {buy_qty}주 (한 종목 예산 ${budget:.2f}) | 분기: inverse")
+    if dry_run or buy_qty <= 0:
+        return
+    if not reserve_ticker_buy(ticker):
+        print(f"   ⏸️ [당일 재진입 차단] {ticker}: 이미 주문했습니다.")
+        return
+
+    res = client.order_us_stock(
+        ticker=ticker, order_type="BUY", qty=buy_qty, price=numeric_price, exchange=exchange_code
+    )
+    return_code = res.get("return_code", -1)
+    print(
+        f"  ➔ 키움 실계좌 매수 접수 응답 ({exchange_code}): [{return_code}] {res.get('return_msg', '응답 없음')} | 분기: inverse"
+    )
+    if str(return_code) == "0":
+        finish_ticker_buy(ticker, accepted=True)
+        send_discord_message(
+            f"🐻 **[하락장 인버스 매수 접수]** {ticker} {buy_qty}주 @ ${numeric_price:.2f}\n"
+            f"- 진입 분기: 하락장 1배 인버스 (inverse)\n"
+            f"- 하락장 근거: {bear_reason}\n"
+            f"- 악재 확인: {news_reason}\n"
+            f"- 손절·익절은 일반 매수와 같은 기준으로 관리돼요"
+        )
+    else:
+        finish_ticker_buy(ticker, accepted=False)
 
 
 def is_market_closing_time() -> bool:

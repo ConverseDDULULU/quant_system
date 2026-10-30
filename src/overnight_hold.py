@@ -61,15 +61,23 @@ def _previous_trading_day(day):
 def get_news_verdict(ticker: str) -> tuple[str, str]:
     """yfinance 헤드라인 + Gemini로 (호재|중립|악재, 근거) 판정. 실패 시 중립"""
     titles = []
-    try:
-        for n in (yf.Ticker(ticker).news or [])[:6]:
-            title = n.get("title")
-            if not title and isinstance(n.get("content"), dict):
-                title = n["content"].get("title")
-            if title:
-                titles.append(f"- {title}")
-    except Exception as e:
-        print(f"⚠️ {ticker} 뉴스 수집 실패: {e}")
+    # yfinance 1.7의 Ticker.news가 빈 목록을 돌려줘서(2026-10-31 확인) Search 결과로 보충한다
+    sources = (
+        lambda: yf.Ticker(ticker).news,
+        lambda: yf.Search(ticker, news_count=8).news,
+    )
+    for fetch in sources:
+        try:
+            for n in (fetch() or [])[:6]:
+                title = n.get("title")
+                if not title and isinstance(n.get("content"), dict):
+                    title = n["content"].get("title")
+                if title:
+                    titles.append(f"- {title}")
+        except Exception as e:
+            print(f"⚠️ {ticker} 뉴스 수집 실패: {e}")
+        if titles:
+            break
 
     if not titles:
         return "중립", "최근 뉴스 없음"
