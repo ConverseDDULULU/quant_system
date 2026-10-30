@@ -200,17 +200,23 @@ def is_new_entry_cutoff_time() -> bool:
 def fetch_real_news_and_ai_report(ticker: str, action: str, price: float) -> str:
     """yfinance 실시간 뉴스 수집 + Gemini 2.5 Flash 200자 브리핑"""
     news_titles = []
-    try:
-        yt = yf.Ticker(ticker)
-        raw_news = yt.news or []
-        for n in raw_news[:4]:
-            title = n.get("title")
-            if not title and isinstance(n.get("content"), dict):
-                title = n["content"].get("title")
-            if title:
-                news_titles.append(f"- {title}")
-    except Exception as e:
-        print(f"⚠️ {ticker} 뉴스 수집 실패: {e}")
+    # yfinance 1.7의 Ticker.news가 빈 목록을 돌려줘서(2026-10-31 확인) Search 결과로 보충한다
+    sources = (
+        lambda: yf.Ticker(ticker).news,
+        lambda: yf.Search(ticker, news_count=8).news,
+    )
+    for fetch in sources:
+        try:
+            for n in (fetch() or [])[:4]:
+                title = n.get("title")
+                if not title and isinstance(n.get("content"), dict):
+                    title = n["content"].get("title")
+                if title:
+                    news_titles.append(f"- {title}")
+        except Exception as e:
+            print(f"⚠️ {ticker} 뉴스 수집 실패: {e}")
+        if news_titles:
+            break
 
     news_context = "\n".join(news_titles) if news_titles else "최근 주요 외신 헤드라인 없음"
 
