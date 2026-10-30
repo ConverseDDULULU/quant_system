@@ -206,8 +206,10 @@ def get_bottom_reversal_signal(client: KiwoomClient, ticker: str, exchange: str)
         cur_slow_d = float(slow_d.iloc[-1])
         is_stoch_golden = (cur_slow_k > cur_slow_d) and (20.0 <= cur_slow_k <= 65.0)
 
-        # 시그널 판정
+        # 시그널 판정 (entry_branch: BUY가 어느 분기에서 났는지, 장마감 분석에서 분기별 성과 비교용)
         signal = "HOLD"
+        entry_branch = None
+        relaxed_passed = None
         if (
             is_reversal_candle
             and is_rsi_bottom
@@ -219,6 +221,7 @@ def get_bottom_reversal_signal(client: KiwoomClient, ticker: str, exchange: str)
             and is_stoch_golden
         ):
             signal = "BUY"
+            entry_branch = "strict"
         elif cur_price < (ema20 * 0.98):
             signal = "SELL"
         elif is_aggressive_entry_mode():
@@ -229,16 +232,20 @@ def get_bottom_reversal_signal(client: KiwoomClient, ticker: str, exchange: str)
                 vol_surge >= 2.0,
                 (cur_slow_k > cur_slow_d) and (20.0 <= cur_slow_k <= 80.0),
             ]
+            relaxed_passed = sum(relaxed_checks)
             if (
                 is_reversal_candle
                 and vwap_supported
                 and is_obv_up
-                and sum(relaxed_checks) >= 3
+                and relaxed_passed >= 3
             ):
                 signal = "BUY"
+                entry_branch = "aggressive"
 
         return {
             "signal": signal,
+            "entry_branch": entry_branch,
+            "relaxed_passed": relaxed_passed,
             "cur_price": cur_price,
             "rsi": rsi,
             "vol_surge": vol_surge,
@@ -497,9 +504,12 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
         k_val = analysis.get("slow_k", 0.0)
         d_val = analysis.get("slow_d", 0.0)
         obv_txt = "유입" if analysis.get("obv_bullish") else "이탈"
+        branch = analysis.get("entry_branch") or "-"
+        relaxed = analysis.get("relaxed_passed")
+        relaxed_txt = f" | 완화 {relaxed}/4" if relaxed is not None else ""
 
         print(
-            f"📊 [{ticker:4s}] 현재가: ${price:6.2f} | 거래량: {vol_surge:4.1f}배 | 이격도: {disparity:5.1f}% | RSI: {rsi_val:4.1f} | Stoch: {k_val:.1f}/{d_val:.1f} | OBV: {obv_txt} | 판정: {sig}"
+            f"📊 [{ticker:4s}] 현재가: ${price:6.2f} | 거래량: {vol_surge:4.1f}배 | 이격도: {disparity:5.1f}% | RSI: {rsi_val:4.1f} | Stoch: {k_val:.1f}/{d_val:.1f} | OBV: {obv_txt} | 판정: {sig} | 분기: {branch}{relaxed_txt}"
         )
 
         if sig == "BUY":
@@ -544,14 +554,16 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
                 return_code = res.get("return_code", -1)
                 return_msg = res.get("return_msg", "응답 없음")
                 print(
-                    f"  ➔ 키움 실계좌 매수 접수 응답 ({exchange_code}): [{return_code}] {return_msg}"
+                    f"  ➔ 키움 실계좌 매수 접수 응답 ({exchange_code}): [{return_code}] {return_msg} | 분기: {branch}"
                 )
                 if str(return_code) == "0":
                     finish_ticker_buy(ticker, accepted=True)
                     usd_available -= numeric_price * buy_qty
+                    branch_label = {"strict": "기본 조건", "aggressive": "공격 모드 완화"}.get(branch, branch)
                     send_discord_message(
                         f"✅ **[매수 주문 접수 성공]** {ticker} {buy_qty}주\n"
                         f"- 주문단가: ${numeric_price:.2f}\n"
+                        f"- 진입 분기: {branch_label} ({branch})\n"
                         f"- 진입 지표: RSI {rsi_val:.1f} | 거래량 {vol_surge:.1f}배 | 20이평 밀착 ({disparity:.1f}%) | Stoch({k_val:.1f}>{d_val:.1f}) | OBV {obv_txt}"
                     )
                 else:
