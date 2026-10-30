@@ -26,3 +26,4 @@ websockets==17.3
 google-genai==2.33.0
 pytz==2026.5
 yfinance==1.7.0
+matplotlib==3.11.2
