@@ -189,6 +189,38 @@ class KiwoomClient:
         data["holdings_list"] = self.get_us_holdings()
         return data
 
+    def get_us_realized_today(self) -> list:
+        """미국주식 당일 실현손익(ust21630, USD)을 종목별로 조회한다.
+
+        행: stk_cd, cntr_sellq(체결매도수량), avg_buy_uv, cntr_sella(체결매도가),
+        tdy_pl_amt(실현손익, 수수료 반영), pl_rt, cmsn(수수료), altx(제세금)
+        """
+        self._ensure_token()
+        headers = {
+            "Content-Type": "application/json;charset=UTF-8",
+            "authorization": f"Bearer {self.access_token}",
+            "api-id": "ust21630",
+        }
+        body = {"stex_tp": "", "stk_cd": "", "fc_krw_tp": "0"}
+        try:
+            res = requests.post(
+                f"{self.base_url}/api/us/acnt", headers=headers, json=body, timeout=10
+            )
+            data = res.json() if res.status_code == 200 else {}
+        except Exception as e:
+            print(f"⚠️ 당일 실현손익(ust21630) 조회 실패: {e}")
+            return []
+        if res.status_code != 200 or str(data.get("return_code", "0")) != "0":
+            print(
+                f"⚠️ 당일 실현손익(ust21630) 오류: HTTP {res.status_code} "
+                f"[{data.get('return_code')}] {data.get('return_msg', '응답 없음')}"
+            )
+            return []
+        rows = data.get("result_list") or []
+        if isinstance(rows, dict):
+            rows = [rows]
+        return [row for row in rows if isinstance(row, dict)]
+
     def get_balance(self) -> dict:
         """스케줄러 호환 잔고 리스트 반환"""
         return {"result_list": self.get_us_holdings()}
