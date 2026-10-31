@@ -95,6 +95,16 @@ def load_trades(start_day, end_day) -> pd.DataFrame:
         return pd.DataFrame()
     df = df[~df["ticker"].astype(str).str.upper().str.startswith("TEST")]
     df["date"] = pd.to_datetime(df["date"]).dt.date
+    # 수수료 반영 순손익(키움 수익률 기준)이 기록된 행은 그 값으로 승률·손익을 집계한다
+    if "net_profit_pct" in df.columns:
+        net_pct = pd.to_numeric(df["net_profit_pct"], errors="coerce")
+        has_net = net_pct.notna()
+        df.loc[has_net, "profit_pct"] = net_pct[has_net]
+        if "net_profit_usd" in df.columns:
+            net_usd = pd.to_numeric(df["net_profit_usd"], errors="coerce")
+        else:
+            net_usd = df["buy_price"] * df["qty"] * net_pct / 100
+        df.loc[has_net, "profit_usd"] = net_usd[has_net]
     return df[(df["date"] >= start_day) & (df["date"] <= end_day)].reset_index(drop=True)
 
 
@@ -266,7 +276,7 @@ def build_report(day, mode, market, today_stats, window_stats, follow, holds, re
         lines.append("- 지수 데이터 조회 실패")
 
     summary = _day_summary_row(day)
-    lines += ["", "## 오늘 매매"]
+    lines += ["", "## 오늘 매매 (수수료 반영 기록이 있는 거래는 순손익 기준)"]
     if summary:
         lines.append(
             f"- 계좌: ${summary['start_balance_usd']:,.2f} → ${summary['end_balance_usd']:,.2f} "

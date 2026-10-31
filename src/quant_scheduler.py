@@ -60,13 +60,17 @@ from src.kiwoom_client import KiwoomClient
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 
 BUY_EXCHANGES = {"ND", "NY"}  # 신규 매수 허용 거래소 (NASDAQ, NYSE)
+AGGRESSIVE_RSI_MAX = 65.0  # 공격 모드에서도 이 값보다 RSI가 높으면(과열) 매수하지 않음
 
 # 익절·손절·수량 등 매매 조건 (data/strategy_params.json, 거래일마다 다시 읽음)
 PARAMS = strategy_params.apply_to_engine()
 
 
-def _log_completed_trade(ticker, buy_price, sell_price, qty, exit_reason):
-    """매도 주문 접수 시 매매 기록 (마감 구간 재시도로 같은 청산이 중복 기록되지 않게)"""
+def _log_completed_trade(ticker, buy_price, sell_price, qty, exit_reason, net_profit_pct=None):
+    """매도 주문 접수 시 매매 기록 (마감 구간 재시도로 같은 청산이 중복 기록되지 않게)
+
+    net_profit_pct: 키움 잔고 수익률(pl_rt). 매수·매도 수수료가 반영된 값이라 결산은 이 값을 우선 쓴다.
+    """
     for t in DAILY_COMPLETED_TRADES:
         if t["ticker"] == ticker and t["qty"] == qty and t["exit_reason"] == exit_reason:
             return
@@ -74,18 +78,21 @@ def _log_completed_trade(ticker, buy_price, sell_price, qty, exit_reason):
         print(f"⚠️ [매매 기록 건너뜀] {ticker}: 매입가/현재가 정보 없음")
         return
     profit_pct = (sell_price - buy_price) / buy_price * 100
+    if net_profit_pct is not None:
+        profit_pct = net_profit_pct
     DAILY_COMPLETED_TRADES.append(
         {
             "ticker": ticker,
             "qty": qty,
             "exit_reason": exit_reason,
             "profit_pct": profit_pct,
-            "profit_usd": (sell_price - buy_price) * qty,
+            "profit_usd": buy_price * qty * profit_pct / 100,
         }
     )
     try:
         # 체결가가 아니라 주문 시점 현재가 기준 추정치
-        record_trade(ticker, buy_price, sell_price, qty, exit_reason)
+        extra = {"net_profit_pct": net_profit_pct} if net_profit_pct is not None else None
+        record_trade(ticker, buy_price, sell_price, qty, exit_reason, extra)
     except Exception as e:
         print(f"⚠️ 매매 기록 저장 실패: {e}")
 
@@ -230,7 +237,8 @@ def get_bottom_reversal_signal(client: KiwoomClient, ticker: str, exchange: str)
         elif cur_price < (ema20 * 0.98):
             signal = "SELL"
         elif is_aggressive_entry_mode():
-            # 공격 모드: 양봉 반등·VWAP 지지·OBV 유입은 필수, 나머지는 넓힌 범위로 4개 중 3개
+            # 공격 모드: 양봉 반등·VWAP 지지·OBV 유입·RSI 과열 아님은 필수, 나머지는 넓힌 범위로 4개 중 3개
+            # (10/30 OIS RSI 68, JKS RSI 79가 RSI만 빠진 채 3/4로 매수돼 곧바로 손절 → 과열 추격 차단)
             relaxed_checks = [
                 30.0 <= rsi <= 60.0,
                 97.5 <= disparity_20 <= 102.5,
@@ -242,6 +250,7 @@ def get_bottom_reversal_signal(client: KiwoomClient, ticker: str, exchange: str)
                 is_reversal_candle
                 and vwap_supported
                 and is_obv_up
+                and rsi <= AGGRESSIVE_RSI_MAX
                 and relaxed_passed >= 3
             ):
                 signal = "BUY"
@@ -433,6 +442,7 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
                             now_price,
                             qty,
                             {"STOP_LOSS": "손절", "TAKE_PROFIT": "익절", "MAX_TAKE_PROFIT": "최대익절"}[exit_rule],
+                            net_profit_pct=profit_rate,
                         )
                         if exit_rule == "STOP_LOSS":
                             breaker = record_stop_loss(
@@ -561,6 +571,12 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
                         f"(${position_budget_usd(INITIAL_BALANCE or usd_available, usd_available):.2f})보다 큽니다."
                     )
                     continue
+                if buy_qty * numeric_price < PARAMS["min_order_usd"]:
+                    # 소액 주문은 이익 금액이 작아도 보유 슬롯을 하나 차지하고 수수료를 낸다
+                    print(
+                        f"   ⚠️ [주문 스킵] {ticker} {buy_qty}주 ${buy_qty * numeric_price:.2f} < 최소 주문 ${PARAMS['min_order_usd']}"
+                    )
+                    continue
 
                 if not reserve_ticker_buy(ticker):
                     print(f"   ⏸️ [당일 재진입 차단] {ticker}: 다른 엔진에서 이미 주문했습니다.")
@@ -618,6 +634,9 @@ def try_inverse_entry(client, held_tickers, usd_available, max_holdings, bear_re
     budget = position_budget_usd(INITIAL_BALANCE or usd_available, usd_available)
     buy_qty = max_position_qty(numeric_price, INITIAL_BALANCE or usd_available, usd_available, PARAMS["max_buy_qty"])
     print(f"   🐻 [하락장 대응] {ticker} ${numeric_price:.2f} x {buy_qty}주 (한 종목 예산 ${budget:.2f}) | 분기: inverse")
+    if buy_qty * numeric_price < PARAMS["min_order_usd"]:
+        print(f"   🐻 [하락장 대응] 주문 금액 ${buy_qty * numeric_price:.2f} < 최소 주문 ${PARAMS['min_order_usd']}, 진입 안 함")
+        return
     if dry_run or buy_qty <= 0:
         return
     if not reserve_ticker_buy(ticker):
@@ -757,7 +776,11 @@ def liquidate_all_positions(client, held_positions: list):
                 buy_price = float(str(item.get("frgn_stk_book_uv", "0")).replace(",", "").strip() or "0")
             except (TypeError, ValueError):
                 buy_price = 0.0
-            _log_completed_trade(ticker, buy_price, curr_price, qty, "장마감청산")
+            try:
+                net_pct = float(str(item.get("pl_rt", "")).replace(",", "").strip())
+            except (TypeError, ValueError):
+                net_pct = None
+            _log_completed_trade(ticker, buy_price, curr_price, qty, "장마감청산", net_profit_pct=net_pct)
         else:
             skipped_orders += 1
         time.sleep(1)
