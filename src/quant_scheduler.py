@@ -342,6 +342,7 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
                 end_balance=final_balance,
                 completed_trades=DAILY_COMPLETED_TRADES,
                 discord_sender=send_discord_message,  # 스케줄러의 디스코드 전송 함수명
+                kiwoom_client=client,  # 키움 당일 실현손익(ust21630)의 실제 수수료로 기록 갱신
             )
             SUMMARY_SENT_DATE = trading_date
         except Exception as e:
