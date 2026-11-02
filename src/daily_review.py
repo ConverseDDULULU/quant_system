@@ -95,6 +95,12 @@ def load_trades(start_day, end_day) -> pd.DataFrame:
         return pd.DataFrame()
     df = df[~df["ticker"].astype(str).str.upper().str.startswith("TEST")]
     df["date"] = pd.to_datetime(df["date"]).dt.date
+    # 수수료 표시용: 수수료 전(가격 기준) 손익과 수수료. fee 칸이 없거나 빈 옛 행은 수수료 0, 출처 none
+    df["gross_profit_usd"] = pd.to_numeric(df["profit_usd"], errors="coerce").fillna(0.0)
+    fee = pd.to_numeric(df["fee_usd"], errors="coerce") if "fee_usd" in df.columns else pd.Series(float("nan"), index=df.index)
+    source = df["fee_source"].fillna("").astype(str) if "fee_source" in df.columns else pd.Series("", index=df.index)
+    df["fee_source"] = source.where(fee.notna() & (source != ""), "none")
+    df["fee_usd"] = fee.fillna(0.0)
     # 수수료 반영 순손익(키움 수익률 기준)이 기록된 행은 그 값으로 승률·손익을 집계한다
     if "net_profit_pct" in df.columns:
         net_pct = pd.to_numeric(df["net_profit_pct"], errors="coerce")
@@ -145,6 +151,10 @@ def trade_stats(df: pd.DataFrame) -> dict:
         "avg_loss_pct": float(losses["profit_pct"].mean()) if len(losses) else 0.0,
         "profit_factor": float(gross_win / gross_loss) if gross_loss > 0 else None,
         "total_usd": float(df["profit_usd"].sum()),
+        # 수수료: 수수료 전 손익(gross) → 수수료 합계 → 수수료 후 손익(total_usd)
+        "gross_usd": float(df["gross_profit_usd"].sum()) if "gross_profit_usd" in df else float(df["profit_usd"].sum()),
+        "fee_usd": float(df["fee_usd"].sum()) if "fee_usd" in df else 0.0,
+        "fee_counts": df["fee_source"].value_counts().to_dict() if "fee_source" in df else {},
         "by_reason": {
             reason: {"count": int(len(g)), "avg_pct": float(g["profit_pct"].mean())}
             for reason, g in df.groupby("exit_reason")
@@ -249,9 +259,11 @@ def propose_changes(stats: dict, follow: dict, holds: list[dict], params: dict) 
 def _gemini_commentary(payload: dict) -> str:
     prompt = (
         "당신은 미국 주식 단타 자동매매 시스템의 일일 리뷰어입니다. 아래 JSON은 오늘 시장 지표, "
-        "최근 매매 통계, 자동 조정 결과입니다.\n"
+        "최근 매매 통계, 자동 조정 결과입니다. 통계의 gross_usd는 수수료 전 손익, fee_usd는 수수료·제세금 합계, "
+        "total_usd는 수수료 후 손익입니다.\n"
         f"{json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
         "한국어로 600자 이내로 작성하세요: (1) 오늘 시장 흐름 한두 문장 (2) 매매 성과에서 눈에 띄는 점 "
+        "(수수료가 손익에 준 영향 포함) "
         "(3) 내일 주의할 점. 숫자는 주어진 데이터만 쓰고 새로 지어내지 마세요. 특정 종목 매수 권유는 하지 마세요."
     )
     return generate_text(prompt, temperature=0.3, timeout=60) or ""
@@ -264,6 +276,24 @@ def _day_summary_row(day) -> dict | None:
         return row.iloc[-1].to_dict() if not row.empty else None
     except Exception:
         return None
+
+
+def _fee_line(label: str, stats: dict) -> str:
+    """수수료·제세금 합계와 이익에 준 영향 한 줄 (키움 실제 값이 아닌 추정·기록 없음 건수 표시)"""
+    fee, gross, net = stats.get("fee_usd", 0.0), stats.get("gross_usd", 0.0), stats.get("total_usd", 0.0)
+    counts = stats.get("fee_counts", {})
+    line = f"- {label} 수수료·제세금 ${fee:.2f} (수수료 전 ${gross:+.2f} → 수수료 후 ${net:+.2f}"
+    if gross > 0 and fee > 0:
+        line += f", 수수료가 수수료 전 이익의 {fee / gross * 100:.0f}%"
+    line += ")"
+    notes = []
+    if counts.get("estimate"):
+        notes.append(f"추정 {counts['estimate']}건")
+    if counts.get("none"):
+        notes.append(f"기록 없음 {counts['none']}건")
+    if notes:
+        line += f" [키움 실제 값 아님: {', '.join(notes)}]"
+    return line
 
 
 def build_report(day, mode, market, today_stats, window_stats, follow, holds, reasons, diff, params, commentary) -> str:
@@ -286,6 +316,7 @@ def build_report(day, mode, market, today_stats, window_stats, follow, holds, re
         lines.append(f"- 청산 {today_stats['count']}건, 승률 {today_stats['win_rate']:.0f}%, 손익 ${today_stats['total_usd']:+.2f}")
         for reason, r in today_stats["by_reason"].items():
             lines.append(f"  - {reason}: {r['count']}건, 평균 {r['avg_pct']:+.2f}%")
+        lines.append(_fee_line("오늘", today_stats))
     else:
         lines.append("- 청산 기록 없음")
 
@@ -298,6 +329,7 @@ def build_report(day, mode, market, today_stats, window_stats, follow, holds, re
             f"손익비 {pf:.2f}" if pf is not None else
             f"- {window_stats['count']}건, 승률 {window_stats['win_rate']:.0f}%, 손실 거래 없음"
         )
+        lines.append(_fee_line("누적", window_stats))
     for key, label in (("stop_recovered", "손절 후 당일 회복"), ("tp_ran_further", "익절 후 +3% 추가 상승")):
         f = follow.get(key, {})
         if f.get("checked"):
