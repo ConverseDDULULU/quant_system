@@ -41,6 +41,8 @@ class KiwoomClient:
 
         self.full_account_no = None  # 10자리 정규 계좌번호
         self.access_token = None
+        self._last_holdings = None  # 마지막 정상 잔고 (조회 실패 시 0으로 오염되지 않게)
+        self._last_deposit = None  # 마지막 정상 예수금
         self.token_expires_at = None  # KST 기준 만료 시각
         self.base_url = "https://api.kiwoom.com"
         self._us_stock_master_cache = {}
@@ -116,6 +118,30 @@ class KiwoomClient:
             print("🔄 [KiwoomClient] 토큰 만료 임박, 재발급합니다.")
             self.authenticate()
 
+    @staticmethod
+    def _is_auth_error(res) -> bool:
+        """토큰 무효 응답인지 (키움은 같은 앱키로 다른 프로세스가 새 토큰을 받으면 기존 토큰을 끊는다)"""
+        if res.status_code == 401:
+            return True
+        try:
+            data = res.json()
+        except ValueError:
+            return False
+        if not isinstance(data, dict):
+            return False
+        return str(data.get("return_code")) == "3" or "8005" in str(data.get("return_msg", ""))
+
+    def _post(self, url: str, headers: dict, json: dict, timeout: float):
+        """키움 POST. 토큰 무효(8005)면 다시 로그인하고 새 토큰으로 한 번만 재시도한다."""
+        res = requests.post(url, headers=headers, json=json, timeout=timeout)
+        if self._is_auth_error(res):
+            print(f"🔄 [KiwoomClient] 토큰 무효({headers.get('api-id')}), 재로그인 후 재시도합니다.")
+            self.authenticate()
+            retry_headers = dict(headers)
+            retry_headers["authorization"] = f"Bearer {self.access_token}"
+            res = requests.post(url, headers=retry_headers, json=json, timeout=timeout)
+        return res
+
     def get_us_holdings(self) -> list:
         """미국주식 원장잔고확인 (ust21070)"""
         self._ensure_token()
@@ -128,7 +154,7 @@ class KiwoomClient:
         body = {"acctNo": self.full_account_no}
 
         try:
-            res = requests.post(url, headers=headers, json=body, timeout=10)
+            res = self._post(url, headers=headers, json=body, timeout=10)
             data = res.json() if res.status_code == 200 else {}
             if res.status_code != 200 or str(data.get("return_code", "0")) != "0":
                 # 실패 시 빈 목록이 '보유 없음'으로 오인되므로 로그로 남긴다
@@ -136,11 +162,19 @@ class KiwoomClient:
                     f"⚠️ 미국주식 보유종목 조회 오류: HTTP {res.status_code} "
                     f"[{data.get('return_code')}] {data.get('return_msg', '응답 없음')}"
                 )
-                return []
-            return data.get("result_list") or data.get("output1") or []
+                return self._stale_holdings()
+            holdings = data.get("result_list") or data.get("output1") or []
+            self._last_holdings = list(holdings)
+            return holdings
         except Exception as e:
             print(f"⚠️ 미국주식 보유종목 조회 실패: {e}")
+            return self._stale_holdings()
+
+    def _stale_holdings(self) -> list:
+        if self._last_holdings is None:
             return []
+        print("   ↳ 마지막 정상 잔고를 대신 사용합니다 (빈 잔고로 처리하지 않음).")
+        return list(self._last_holdings)
 
     def get_us_cash_usd(self) -> float | None:
         """통화별 예수금(ust21120)의 USD 외화예수금. 실패 시 None
@@ -150,7 +184,7 @@ class KiwoomClient:
         """
         self._ensure_token()
         try:
-            res = requests.post(
+            res = self._post(
                 f"{self.base_url}/api/us/acnt",
                 headers={
                     "Content-Type": "application/json;charset=UTF-8",
@@ -180,7 +214,7 @@ class KiwoomClient:
         body = {"acctNo": self.full_account_no}
 
         try:
-            res = requests.post(url, headers=headers, json=body, timeout=10)
+            res = self._post(url, headers=headers, json=body, timeout=10)
             data = res.json() if res.status_code == 200 else {}
         except Exception as e:
             print(f"⚠️ 예수금 조회 통신 실패: {e}")
@@ -203,7 +237,7 @@ class KiwoomClient:
         }
         body = {"stex_tp": "", "stk_cd": "", "fc_krw_tp": "0"}
         try:
-            res = requests.post(
+            res = self._post(
                 f"{self.base_url}/api/us/acnt", headers=headers, json=body, timeout=10
             )
             data = res.json() if res.status_code == 200 else {}
@@ -253,7 +287,7 @@ class KiwoomClient:
                 headers["next-key"] = next_key
 
             try:
-                response = requests.post(
+                response = self._post(
                     url,
                     headers=headers,
                     json={"stex_tp": exchange},
@@ -307,7 +341,7 @@ class KiwoomClient:
             "api-id": "usa20100",
         }
         try:
-            response = requests.post(
+            response = self._post(
                 f"{self.base_url}/api/us/mrkcond",
                 headers=headers,
                 json={"stex_tp": exchange.upper(), "stk_cd": ticker.upper().strip()},
@@ -348,7 +382,7 @@ class KiwoomClient:
                 page_headers["cont-yn"] = cont_yn
                 page_headers["next-key"] = next_key
             try:
-                response = requests.post(
+                response = self._post(
                     f"{self.base_url}/api/us/rkinfo",
                     headers=page_headers,
                     json=body,
@@ -462,7 +496,7 @@ class KiwoomClient:
                 page_headers["cont-yn"] = cont_yn
                 page_headers["next-key"] = next_key
             try:
-                response = requests.post(
+                response = self._post(
                     f"{self.base_url}/api/us/chart",
                     headers=page_headers,
                     json=body,
@@ -563,6 +597,16 @@ class KiwoomClient:
         """주문가능 외화(USD) 및 원화 예수금 추출"""
         try:
             balance = self.get_us_balance() or {}
+            if str(balance.get("return_code", "")) != "0":
+                # 인증 실패 등으로 0원이 되면 계좌 평가액·서킷브레이커 기준잔고가 오염된다
+                print(
+                    f"⚠️ 예수금 조회 오류(ust21110): [{balance.get('return_code')}] "
+                    f"{balance.get('return_msg', '응답 없음')}"
+                )
+                if self._last_deposit is not None:
+                    print("   ↳ 마지막 정상 예수금을 대신 사용합니다.")
+                    return dict(self._last_deposit)
+                return {"krw_deposit": 0.0, "usd_deposit": 0.0}
             krw = safe_float(balance.get("krw_entra") or balance.get("krw_dncl_amt") or 0.0)
 
             usd = 0.0
@@ -575,9 +619,12 @@ class KiwoomClient:
                     usd = safe_float(item.get("fc_ord_alowa") or item.get("fc_entra") or 0.0)
                     break
 
-            return {"usd_deposit": usd, "krw_deposit": krw}
+            self._last_deposit = {"usd_deposit": usd, "krw_deposit": krw}
+            return dict(self._last_deposit)
         except Exception as e:
             print(f"⚠️ 예수금 파싱 오류: {e}")
+            if self._last_deposit is not None:
+                return dict(self._last_deposit)
             return {"krw_deposit": 0.0, "usd_deposit": 0.0}
 
     def _get_current_price(self, ticker: str) -> float:
@@ -680,7 +727,7 @@ class KiwoomClient:
         )
 
         try:
-            res = requests.post(url, headers=headers, json=body, timeout=10)
+            res = self._post(url, headers=headers, json=body, timeout=10)
             data = res.json()
             print(f"📦 [키움 주문 원본 응답]: {data}")
             return data
