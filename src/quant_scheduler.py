@@ -10,10 +10,11 @@ from dotenv import load_dotenv
 import warnings
 import pytz
 import bear_mode
+import sector_guard
 import daily_review
 import strategy_params
 import trading_safety
-from market_calendar import market_phase, next_market_open, now_ny, seconds_until_next_open
+from market_calendar import market_phase, next_market_open, now_ny, seconds_until_next_open, session_bounds
 from overnight_hold import select_overnight_holds
 from trade_logger import finalize_daily_summary, record_trade
 from trading_safety import (
@@ -41,6 +42,7 @@ from trading_safety import (
 # 당일 세션 데이터 추적용 전역 변수
 INITIAL_BALANCE = None  # 장 시작 시 최초 1회 기록
 DAILY_COMPLETED_TRADES = []  # 오늘 청산된 종목 누적 리스트
+TODAY_BOUGHT = []  # 오늘 매수 주문이 접수된 종목 (업종 중복 검사용)
 CURRENT_TRADING_DATE = None  # 뉴욕 기준 거래일 (바뀌면 당일 상태 초기화)
 SUMMARY_SENT_DATE = None  # 일일 결산을 이미 보낸 거래일
 HOLD_NOTICE_DATE = None  # 오버나잇 홀딩 판정 알림을 보낸 거래일
@@ -291,13 +293,14 @@ def get_exchange_code(client: KiwoomClient, ticker: str) -> str:
 
 def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
     """자동매매 1회 점검 사이클 (+3.5% 익절 / +7.0% 강제 익절 / -1.8% 손절)"""
-    global INITIAL_BALANCE, DAILY_COMPLETED_TRADES, CURRENT_TRADING_DATE, SUMMARY_SENT_DATE, PARAMS
+    global INITIAL_BALANCE, DAILY_COMPLETED_TRADES, CURRENT_TRADING_DATE, SUMMARY_SENT_DATE, PARAMS, TODAY_BOUGHT
     trading_date = now_ny().date().isoformat()
     if CURRENT_TRADING_DATE != trading_date:
         # 24시간 상시 가동 시 전날 시작 잔고·청산 내역이 이월되지 않도록 초기화
         CURRENT_TRADING_DATE = trading_date
         INITIAL_BALANCE = None
         DAILY_COMPLETED_TRADES = []
+        TODAY_BOUGHT = []
         # 전날 장 마감 후 자동 조정된 매매 조건 반영
         PARAMS = strategy_params.apply_to_engine()
         print(f"⚙️ [매매 조건] {PARAMS}")
@@ -474,6 +477,13 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
         print(f"🛑 [일일 서킷브레이커] 신규 매수 차단: {breaker['reason']}")
         return
 
+    # 개장 직후 N분은 변동성·호가 차이가 크고 거래량 배수가 부풀어 신규 매수(인버스 포함)를 하지 않는다.
+    # 손절·익절·청산은 위 1단계에서 이미 처리돼 영향 없음
+    minutes_open = minutes_since_open()
+    if minutes_open is not None and minutes_open < PARAMS["open_entry_delay_min"]:
+        print(f"⏳ [개장 직후] 신규 매수 대기: 개장 {minutes_open:.0f}분 경과 < {PARAMS['open_entry_delay_min']}분")
+        return
+
     MAX_HOLDINGS = PARAMS["max_holdings"]
 
     # 하락장 대응: 하락 추세 + 악재 확인 시 일반 매수 대신 1배 인버스 ETF 진입 (bear_mode.py)
@@ -579,6 +589,12 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
                     )
                     continue
 
+                # 같은 업종(예: 금광주 여러 개)에 계좌가 몰리지 않게 보유·오늘 매수 종목과 업종 중복 검사
+                same = sector_guard.find_same_industry(ticker, set(held_tickers) | set(TODAY_BOUGHT))
+                if same:
+                    print(f"   🧭 [업종 중복] {ticker} 매수 안 함: {same[0]}와 같은 업종({same[1]})")
+                    continue
+
                 if not reserve_ticker_buy(ticker):
                     print(f"   ⏸️ [당일 재진입 차단] {ticker}: 다른 엔진에서 이미 주문했습니다.")
                     continue
@@ -597,6 +613,7 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
                 )
                 if str(return_code) == "0":
                     finish_ticker_buy(ticker, accepted=True)
+                    TODAY_BOUGHT.append(ticker)
                     usd_available -= numeric_price * buy_qty
                     branch_label = {"strict": "기본 조건", "aggressive": "공격 모드 완화"}.get(branch, branch)
                     send_discord_message(
@@ -608,6 +625,15 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
                 else:
                     finish_ticker_buy(ticker, accepted=False)
                 time.sleep(2)
+
+
+def minutes_since_open() -> float | None:
+    """오늘 정규장 개장 후 지난 분. 휴장일이면 None"""
+    now = now_ny()
+    bounds = session_bounds(now.date())
+    if not bounds:
+        return None
+    return (now - bounds[0]).total_seconds() / 60
 
 
 def try_inverse_entry(client, held_tickers, usd_available, max_holdings, bear_reason, dry_run):
@@ -653,6 +679,7 @@ def try_inverse_entry(client, held_tickers, usd_available, max_holdings, bear_re
     )
     if str(return_code) == "0":
         finish_ticker_buy(ticker, accepted=True)
+        TODAY_BOUGHT.append(ticker)
         send_discord_message(
             f"🐻 **[하락장 인버스 매수 접수]** {ticker} {buy_qty}주 @ ${numeric_price:.2f}\n"
             f"- 진입 분기: 하락장 1배 인버스 (inverse)\n"
