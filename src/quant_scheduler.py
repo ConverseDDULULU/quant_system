@@ -253,7 +253,7 @@ def get_bottom_reversal_signal(client: KiwoomClient, ticker: str, exchange: str)
                 and vwap_supported
                 and is_obv_up
                 and rsi <= AGGRESSIVE_RSI_MAX
-                and vol_surge >= 1.0  # 11/2 UPWK 거래량 0.4배(거래 한산)로 매수돼 손절 → 평균 미만 거래량 차단
+                and vol_surge >= 2.0  # 11/2 UPWK 0.4배·11/3 IREN 1.0배 손절 → 공격 모드 승리 4건은 모두 거래량 2배 이상, 2배 미만 차단
                 and relaxed_passed >= 3
             ):
                 signal = "BUY"
