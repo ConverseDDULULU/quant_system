@@ -131,6 +131,12 @@ class KiwoomClient:
             return False
         return str(data.get("return_code")) == "3" or "8005" in str(data.get("return_msg", ""))
 
+    @staticmethod
+    def _is_no_data_msg(data: dict) -> bool:
+        """return_code가 0이 아니어도 '내역 없음' 안내면 조회 실패가 아니라 빈 결과다"""
+        msg = str(data.get("return_msg", "")).replace(" ", "")
+        return str(data.get("return_code")) != "3" and ("내역이없" in msg or "조회할내용이없" in msg)
+
     def _post(self, url: str, headers: dict, json: dict, timeout: float):
         """키움 POST. 토큰 무효(8005)면 다시 로그인하고 새 토큰으로 한 번만 재시도한다."""
         res = requests.post(url, headers=headers, json=json, timeout=timeout)
@@ -156,6 +162,9 @@ class KiwoomClient:
         try:
             res = self._post(url, headers=headers, json=body, timeout=10)
             data = res.json() if res.status_code == 200 else {}
+            if res.status_code == 200 and str(data.get("return_code", "0")) != "0" and self._is_no_data_msg(data):
+                self._last_holdings = []
+                return []
             if res.status_code != 200 or str(data.get("return_code", "0")) != "0":
                 # 실패 시 빈 목록이 '보유 없음'으로 오인되므로 로그로 남긴다
                 print(
@@ -265,7 +274,11 @@ class KiwoomClient:
         order_time(KST), cancel_pending(이 주문에 대한 취소가 접수됨), raw(키움 원본 행)
         exchange: 응답에 거래소 코드가 없어(stex_nm="미국") 종목 마스터에서 찾는다. 못 찾으면 "".
         """
-        self._ensure_token()
+        try:
+            self._ensure_token()
+        except Exception as e:
+            print(f"⚠️ 미체결(ust21050) 조회 실패: {e}")
+            return None
         url = f"{self.base_url}/api/us/acnt"
         body = {"ord_dt": ord_dt, "slby_tp": "0", "stex_tp": "", "stk_cd": ""}
         rows = []
@@ -287,6 +300,9 @@ class KiwoomClient:
             except Exception as e:
                 print(f"⚠️ 미체결(ust21050) 조회 실패: {e}")
                 return None
+            if res.status_code == 200 and isinstance(data, dict) and str(data.get("return_code")) != "0" and self._is_no_data_msg(data):
+                print(f"ℹ️ 미체결(ust21050) 내역 없음 응답: [{data.get('return_code')}] {data.get('return_msg')}")
+                break
             if res.status_code != 200 or not isinstance(data, dict) or str(data.get("return_code")) != "0":
                 detail = data if not isinstance(data, dict) else f"[{data.get('return_code')}] {data.get('return_msg', '응답 없음')}"
                 print(f"⚠️ 미체결(ust21050) 오류: HTTP {res.status_code} {detail}")
@@ -375,7 +391,10 @@ class KiwoomClient:
         if not ticker or exchange not in {"ND", "NY", "NA"}:
             return {"return_code": -1, "return_msg": f"종목·거래소를 확인할 수 없습니다: {ticker} ({exchange or 'UNKNOWN'})"}
 
-        self._ensure_token()
+        try:
+            self._ensure_token()
+        except Exception as e:
+            return {"return_code": -1, "return_msg": f"로그인 실패로 취소 요청을 보내지 못했습니다: {e}"}
         headers = {
             "Content-Type": "application/json;charset=UTF-8",
             "authorization": f"Bearer {self.access_token}",
