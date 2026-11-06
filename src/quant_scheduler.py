@@ -43,6 +43,7 @@ from trading_safety import (
 INITIAL_BALANCE = None  # 장 시작 시 최초 1회 기록
 DAILY_COMPLETED_TRADES = []  # 오늘 청산된 종목 누적 리스트
 TODAY_BOUGHT = []  # 오늘 매수 주문이 접수된 종목 (업종 중복 검사용)
+LAST_SCAN_AT = None  # 마지막 후보 스캔 시각 (time.monotonic)
 CURRENT_TRADING_DATE = None  # 뉴욕 기준 거래일 (바뀌면 당일 상태 초기화)
 SUMMARY_SENT_DATE = None  # 일일 결산을 이미 보낸 거래일
 HOLD_NOTICE_DATE = None  # 오버나잇 홀딩 판정 알림을 보낸 거래일
@@ -61,6 +62,8 @@ from src.kiwoom_client import KiwoomClient
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 
+HOLDING_CHECK_SECONDS = 30  # 보유 종목 손절·익절·청산 점검 간격 (30초 아래로 내리지 않는다)
+SCAN_INTERVAL_SECONDS = 55  # 후보 스캔·신규 매수 최소 간격 (점검 2번에 1번, 약 60초마다)
 BUY_EXCHANGES = {"ND", "NY"}  # 신규 매수 허용 거래소 (NASDAQ, NYSE)
 AGGRESSIVE_RSI_MAX = 65.0  # 공격 모드에서도 이 값보다 RSI가 높으면(과열) 매수하지 않음
 
@@ -287,7 +290,7 @@ def get_exchange_code(client: KiwoomClient, ticker: str) -> str:
 
 def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
     """자동매매 1회 점검 사이클 (+3.5% 익절 / +7.0% 강제 익절 / -1.8% 손절)"""
-    global INITIAL_BALANCE, DAILY_COMPLETED_TRADES, CURRENT_TRADING_DATE, SUMMARY_SENT_DATE, PARAMS, TODAY_BOUGHT
+    global INITIAL_BALANCE, DAILY_COMPLETED_TRADES, CURRENT_TRADING_DATE, SUMMARY_SENT_DATE, PARAMS, TODAY_BOUGHT, LAST_SCAN_AT
     trading_date = now_ny().date().isoformat()
     if CURRENT_TRADING_DATE != trading_date:
         # 24시간 상시 가동 시 전날 시작 잔고·청산 내역이 이월되지 않도록 초기화
@@ -443,6 +446,11 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
                             net_profit_pct=profit_rate,
                         )
                         if exit_rule == "STOP_LOSS":
+                            # 점검 간격별 비교용: 손절 기준을 얼마나 넘어서 팔았는지
+                            print(
+                                f"   📐 [손절 초과폭] {ticker} 수익률 {profit_rate:+.2f}% / 기준 {trading_safety.STOP_LOSS_PCT:+.2f}% / "
+                                f"초과 {trading_safety.STOP_LOSS_PCT - profit_rate:.2f}%p / 점검 {HOLDING_CHECK_SECONDS}초"
+                            )
                             breaker = record_stop_loss(
                                 position_key=f"scheduler:{ticker}:{buy_price:.4f}:{qty}",
                                 estimated_loss=max(0.0, (buy_price - now_price) * qty),
@@ -461,7 +469,11 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
         
         
 
-    # 2단계: 급등 전 바닥 선취매 스캔
+    # 2단계: 급등 전 바닥 선취매 스캔 (보유 점검은 30초마다, 스캔·신규 매수는 약 60초마다)
+    if LAST_SCAN_AT is not None and time.monotonic() - LAST_SCAN_AT < SCAN_INTERVAL_SECONDS:
+        return
+    LAST_SCAN_AT = time.monotonic()
+
     breaker = get_circuit_breaker_status(usd_available)
     if breaker["newly_blocked"]:
         send_discord_message(
@@ -854,8 +866,8 @@ def main():
         except Exception as e:
             print(f"❌ 사이클 실행 중 에러 발생: {e}")
 
-        print("⏳ 다음 점검 사이클까지 60초 대기 중... (종료: Ctrl + C)")
-        time.sleep(60)
+        print(f"⏳ 다음 점검 사이클까지 {HOLDING_CHECK_SECONDS}초 대기 중... (종료: Ctrl + C)")
+        time.sleep(HOLDING_CHECK_SECONDS)
 
 
 if __name__ == "__main__":
