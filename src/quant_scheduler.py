@@ -187,14 +187,7 @@ def get_bottom_reversal_signal(client: KiwoomClient, ticker: str, exchange: str)
         vwap = float((typical_price * volumes).sum() / (volumes.sum() + 1e-9))
         vwap_supported = cur_price >= (vwap * 0.995)
 
-        # 6. 볼린저 밴드 하단 지지 여부
-        std20 = closes.rolling(20).std().iloc[-1]
-        lower_band = float(ema20 - (std20 * 2))
-        near_band_support = (cur_price <= (lower_band * 1.02)) or (
-            cur_price >= lower_band
-        )
-
-        # 7. OBV 자금 유입 확인
+        # 6. OBV 자금 유입 확인
         obv = (np.sign(delta) * volumes).fillna(0).cumsum()
         obv_ma = float(obv.rolling(window=5).mean().iloc[-1])
         is_obv_up = bool(obv.iloc[-1] > obv_ma)
@@ -209,7 +202,7 @@ def get_bottom_reversal_signal(client: KiwoomClient, ticker: str, exchange: str)
             candle_green=is_cur_green,
         )
 
-        # 8. 스토캐스틱 슬로우 (%K, %D 계산)
+        # 7. 스토캐스틱 슬로우 (%K, %D 계산)
         lowest_low = lows.rolling(window=14).min()
         highest_high = highs.rolling(window=14).max()
         fast_k = ((closes - lowest_low) / (highest_high - lowest_low + 1e-9)) * 100
@@ -221,6 +214,7 @@ def get_bottom_reversal_signal(client: KiwoomClient, ticker: str, exchange: str)
         is_stoch_golden = (cur_slow_k > cur_slow_d) and (20.0 <= cur_slow_k <= 65.0)
 
         # 시그널 판정 (entry_branch: BUY가 어느 분기에서 났는지, 장마감 분석에서 분기별 성과 비교용)
+        # 기본 조건은 아래 7개 모두 충족 (항상 참이던 볼린저 하단 지지 조건은 2026-11-07 제거, 동작 변화 없음)
         signal = "HOLD"
         entry_branch = None
         relaxed_passed = None
@@ -230,7 +224,6 @@ def get_bottom_reversal_signal(client: KiwoomClient, ticker: str, exchange: str)
             and is_tight_ma
             and is_volume_burst
             and vwap_supported
-            and near_band_support
             and is_obv_up
             and is_stoch_golden
         ):
