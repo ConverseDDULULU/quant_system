@@ -289,6 +289,42 @@ def get_exchange_code(client: KiwoomClient, ticker: str) -> str:
     return "UNKNOWN"
 
 
+def _check_pending_orders(client, closing: bool, dry_run: bool) -> tuple[list, bool, set]:
+    """(대기 주문, 조회 성공 여부, 대기 매도 종목)
+
+    여기서 어떤 오류가 나도 예외를 밖으로 내지 않는다. 대기 주문 처리 때문에 손절·익절·청산이 멈추면 안 되고,
+    실패하면 ok=False로 그 사이클의 신규 매수만 쉰다.
+    """
+    if dry_run:
+        return [], True, set()
+    pending, ok = [], False
+    try:
+        session = session_bounds(now_ny().date())
+        pending, ok = pending_orders.fetch(
+            client, session[0].astimezone(pending_orders.KST) if session else None
+        )
+        exchange_of = lambda t: get_exchange_code(client, t)
+        if closing:
+            # 청산 뒤에 매수가 체결돼 의도치 않게 밤을 넘기지 않도록 대기 매수를 먼저 모두 취소
+            pending_orders.cancel_all_buys(client, pending, exchange_of, "장마감 청산 전")
+        pending_orders.cancel_expired(
+            client,
+            pending,
+            float("inf") if closing else PARAMS["pending_buy_timeout_sec"],
+            PARAMS["stale_sell_reprice_sec"],
+            exchange_of,
+        )
+    except Exception as e:
+        print(f"⚠️ [대기 주문 처리 오류] {type(e).__name__}: {e} (손절·익절은 계속, 신규 매수만 쉼)")
+        ok = False
+        pending = pending or pending_orders.known_orders()
+    try:
+        return pending, ok, pending_orders.sell_tickers(pending)
+    except Exception as e:
+        print(f"⚠️ [대기 주문 처리 오류] {type(e).__name__}: {e} (손절·익절은 계속, 신규 매수만 쉼)")
+        return [], False, set()
+
+
 def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
     """자동매매 1회 점검 사이클 (+3.5% 익절 / +7.0% 강제 익절 / -1.8% 손절)"""
     global INITIAL_BALANCE, DAILY_COMPLETED_TRADES, CURRENT_TRADING_DATE, SUMMARY_SENT_DATE, PARAMS, TODAY_BOUGHT, LAST_SCAN_AT
@@ -311,23 +347,17 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
     print("=" * 65)
 
     # 0단계: 장마감 10분 전 감지 시 일괄 청산 후 신규 진입 차단
+    # 대기 주문을 잔고보다 먼저 읽는다. 그 사이 체결돼도 양쪽에 보일 뿐이라 안전하다
+    # (잔고를 먼저 읽으면 양쪽 다 놓쳐 한도를 넘겨 사거나 이미 팔린 종목을 다시 팔 수 있다)
+    closing = is_market_closing_time()
+    pending, pending_ok, pending_sells = _check_pending_orders(client, closing, dry_run)
+
     balance_res = client.get_balance()
     holdings = balance_res.get("result_list", [])
 
-    # 대기 주문: 키움 미체결 조회로 매 사이클 다시 읽는다 (조회 실패 시 직전 목록 유지, 신규 매수만 쉼)
-    exchange_of = lambda t: get_exchange_code(client, t)
-    pending, pending_ok = [], True
-    if not dry_run:
-        session = session_bounds(now_ny().date())
-        pending, pending_ok = pending_orders.fetch(
-            client, session[0].astimezone(pending_orders.KST) if session else None
-        )
-
-    if is_market_closing_time():
-        # 청산 뒤에 매수가 체결돼 의도치 않게 밤을 넘기지 않도록 대기 매수를 먼저 모두 취소
-        pending = pending_orders.cancel_all_buys(client, pending, exchange_of, "장마감 청산 전")
+    if closing:
         if holdings:
-            liquidate_all_positions(client, holdings, pending_orders.sell_tickers(pending))
+            liquidate_all_positions(client, holdings, pending_sells)
             print(
                 "💤 장마감 청산 주문 처리를 마쳤습니다. 실제 체결은 계좌 잔고에서 확인하세요."
             )
@@ -371,11 +401,6 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
         current_equity = account_equity_usd(client, usd_available, holdings)
         risk_state = get_circuit_breaker_status(current_equity)
         INITIAL_BALANCE = risk_state["starting_balance"] or current_equity
-    pending = pending_orders.cancel_expired_buys(
-        client, pending, PARAMS["pending_buy_timeout_sec"], exchange_of
-    )
-    pending_sells = pending_orders.sell_tickers(pending)
-
     # 1단계: 보유 종목 동적 익절/손절 감시
     held_tickers = []
 
@@ -512,8 +537,12 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
     pending_buys = pending_orders.buy_tickers(pending)
     if pending_buys:
         reserved = pending_orders.reserved_cash(pending)
+        # 주문가능금액에 대기 금액이 이미 빠져 있으면 이중 차감(매수를 덜 하는 쪽). 첫 장 로그로 확인할 수 있게 함께 출력
+        print(
+            f"⏳ [대기 매수] {', '.join(pending_buys)} (주문가능 ${usd_available:.2f} - 대기 ${reserved:.2f} "
+            f"= ${max(0.0, usd_available - reserved):.2f}, 잠시 전 주문가능과 비교 필요)"
+        )
         usd_available = max(0.0, usd_available - reserved)
-        print(f"⏳ [대기 매수] {', '.join(pending_buys)} (묶인 금액 ${reserved:.2f}, 남은 현금 ${usd_available:.2f})")
         held_tickers.extend(t for t in pending_buys if t not in held_tickers)
 
     # 개장 직후 N분은 변동성·호가 차이가 크고 거래량 배수가 부풀어 신규 매수(인버스 포함)를 하지 않는다.

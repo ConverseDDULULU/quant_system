@@ -6,9 +6,12 @@
 - 정해진 시간 안에 체결 안 된 매수는 취소, 장마감 청산 전에는 대기 매수를 모두 취소
 - 대기 매도가 있으면 매도 주문을 다시 내지 않는다
 - 조회 실패는 "대기 없음"이 아니다: 직전에 알던 목록을 유지하고 그 사이클의 신규 매수를 쉰다
-- 취소 접수(return_code 0)는 취소 완료가 아니다: 다음 조회에서 사라질 때까지 대기 주문으로 계산한다
+- 취소 접수(return_code 0)는 취소 완료가 아니고, 거절(한도 초과 등 일시적일 수 있음)은 주문이 살아 있을 수 있다.
+  그래서 어느 쪽이든 미체결 목록에서 사라질 때까지 대기 주문으로 계산한다
+  (이미 체결된 주문은 잔량이 없어 다음 조회에서 저절로 빠진다)
 """
 
+import time
 from datetime import datetime, timedelta
 
 import pytz
@@ -16,10 +19,11 @@ import pytz
 KST = pytz.timezone("Asia/Seoul")
 SLOW_SELL_WARN_SECONDS = 120
 SESSION_MARGIN_SECONDS = 60
+CANCEL_RETRY_SECONDS = 60  # 취소가 접수됐는데도 목록에 남아 있으면 다시 요청하는 간격
 
 _known: dict[tuple, dict] = {}  # 직전에 알던 대기 주문
-_cancel_requested: set[tuple] = set()  # 이 프로세스가 취소를 접수한 주문 (체결 시간 로그에서 제외)
-_rejected: set[tuple] = set()  # 키움이 취소를 거절한 주문 (이미 체결 등). 대기 주문으로 보지 않음
+_cancel_requested: dict[tuple, float] = {}  # 취소를 접수한 주문 -> 접수 시각 (time.monotonic)
+_cancel_failed_logged: set[tuple] = set()  # 취소 실패 로그를 이미 남긴 주문 (사이클마다 반복 출력 방지)
 
 
 def _key(order: dict) -> tuple:
@@ -29,7 +33,12 @@ def _key(order: dict) -> tuple:
 def reset_state() -> None:
     _known.clear()
     _cancel_requested.clear()
-    _rejected.clear()
+    _cancel_failed_logged.clear()
+
+
+def known_orders() -> list[dict]:
+    """직전에 알던 대기 주문 (조회 실패·오류 때 사용)"""
+    return list(_known.values())
 
 
 def order_age_seconds(order_time: str, now: datetime) -> float | None:
@@ -64,7 +73,7 @@ def fetch(client, session_start: datetime | None = None, now: datetime | None = 
             result = None
         if result is None:
             print("⚠️ [대기 주문 조회 실패] 직전 목록 유지, 이번 사이클 신규 매수 쉼")
-            return list(_known.values()), False
+            return known_orders(), False
         rows.extend(result)
 
     max_age = None
@@ -75,21 +84,17 @@ def fetch(client, session_start: datetime | None = None, now: datetime | None = 
     for row in rows:
         order = dict(row)
         order["age_seconds"] = order_age_seconds(order.get("order_time"), now)
-        key = _key(order)
-        if key in _rejected:
-            continue
         if max_age is not None and order["age_seconds"] is not None and order["age_seconds"] > max_age:
             continue
-        current[key] = order
+        current[_key(order)] = order
 
     for key, order in _known.items():
         if key in current:
             continue
-        if key in _cancel_requested:
-            _cancel_requested.discard(key)
-            print(f"⏱️ [대기 주문 취소 확인] {order['ticker']} {order['unfilled_qty']}주 미체결 목록에서 사라짐")
-            continue
-        if key in _rejected:
+        cancel_requested = _cancel_requested.pop(key, None) is not None
+        _cancel_failed_logged.discard(key)
+        if cancel_requested:
+            print(f"⏱️ [대기 주문 취소 확인] {order['ticker']} {order['side']} {order['unfilled_qty']}주 미체결 목록에서 사라짐")
             continue
         age = order.get("age_seconds")
         age_text = f"약 {age:.0f}초" if age is not None else "시간 미상"
@@ -118,40 +123,51 @@ def reserved_cash(orders: list[dict]) -> float:
 
 
 def _cancel(client, order: dict, exchange_of, reason: str) -> None:
-    """미체결 수량 취소 요청. 결과는 다음 조회로 확인한다 (접수 ≠ 완료, 거절 = 이미 체결 등)"""
-    if order.get("cancel_pending") or _key(order) in _cancel_requested:
+    """미체결 수량 취소 요청. 결과는 다음 조회로 확인한다 (접수 ≠ 완료). 실패하면 다음 사이클에 다시 시도"""
+    key = _key(order)
+    requested_at = _cancel_requested.get(key)
+    if requested_at is not None and time.monotonic() - requested_at < CANCEL_RETRY_SECONDS:
+        return
+    if requested_at is None and order.get("cancel_pending"):
         return
     exchange = order.get("exchange") or exchange_of(order["ticker"])
-    result = client.cancel_us_order(order["order_no"], order["ticker"], exchange)
-    code = int(result.get("return_code", -2))
-    filled = f", 체결 {order['filled_qty']}주는 보유" if order.get("filled_qty") else ""
-    message = result.get("return_msg", "응답 없음")
-    if code == 0:
-        _cancel_requested.add(_key(order))
-        print(f"⏱️ [대기 주문 취소] {order['ticker']} {order['unfilled_qty']}주 {reason}{filled}")
-    elif code > 0:
-        # 이미 체결 등으로 키움이 거절: 체결됐다면 잔고에 보유로 나타난다
-        _rejected.add(_key(order))
-        print(f"⚠️ [대기 주문 취소 거절] {order['ticker']} {reason}: [{code}] {message} (체결됐으면 보유로 처리)")
-    else:
-        print(f"⚠️ [대기 주문 취소 불명] {order['ticker']} {reason}: [{code}] {message} (다음 조회로 확인)")
+    result = client.cancel_us_order(order["order_no"], order["ticker"], exchange) or {}
+    code = str(result.get("return_code", "")).strip()
+    if code == "0":
+        _cancel_requested[key] = time.monotonic()
+        _cancel_failed_logged.discard(key)
+        filled = f", 체결 {order['filled_qty']}주는 보유" if order.get("filled_qty") else ""
+        print(f"⏱️ [대기 주문 취소] {order['ticker']} {order['side']} {order['unfilled_qty']}주 {reason}{filled}")
+    elif key not in _cancel_failed_logged:
+        _cancel_failed_logged.add(key)
+        print(
+            f"⚠️ [대기 주문 취소 실패] {order['ticker']} {order['side']} {reason}: "
+            f"[{code}] {result.get('return_msg', '응답 없음')} (목록에 남아 있는 동안 대기로 계산, 매 사이클 재시도)"
+        )
 
 
-def cancel_expired_buys(client, orders: list[dict], timeout_seconds: float, exchange_of) -> list[dict]:
-    """시간 초과 매수에 취소를 요청하고, 거절된 주문을 뺀 대기 주문 목록을 돌려준다"""
+def cancel_expired(client, orders: list[dict], buy_timeout: float, sell_reprice: float, exchange_of) -> None:
+    """오래된 대기 주문 처리
+
+    매수: buy_timeout초 지나면 취소.
+    매도: sell_reprice초(0이면 끔) 지나면 취소. 잔량이 목록에서 사라진 뒤에야 다음 사이클 손절·익절 판단이
+    새 가격으로 다시 주문하므로(그 전까지는 대기 매도로 재주문 차단) 이중 매도가 나지 않는다.
+    """
     for order in orders:
         age = order.get("age_seconds")
         if age is None:
             continue
-        if order["side"] == "BUY" and age >= timeout_seconds:
-            _cancel(client, order, exchange_of, f"{age / 60:.1f}분 미체결")
-        elif order["side"] == "SELL" and age >= SLOW_SELL_WARN_SECONDS:
+        if order["side"] == "BUY":
+            if age >= buy_timeout:
+                _cancel(client, order, exchange_of, f"{age / 60:.1f}분 미체결")
+        elif sell_reprice > 0 and age >= sell_reprice:
+            _cancel(client, order, exchange_of, f"{age:.0f}초 미체결, 새 가격으로 재주문 예정")
+        elif age >= SLOW_SELL_WARN_SECONDS and _key(order) not in _cancel_failed_logged:
+            _cancel_failed_logged.add(_key(order))
             print(f"⚠️ [매도 대기 지연] {order['ticker']} {order['unfilled_qty']}주 {age / 60:.1f}분째 미체결 @ ${order['order_price']:.2f}")
-    return [order for order in orders if _key(order) not in _rejected]
 
 
-def cancel_all_buys(client, orders: list[dict], exchange_of, reason: str) -> list[dict]:
-    """대기 매수 전부에 취소를 요청하고, 거절된 주문을 뺀 대기 주문 목록을 돌려준다"""
+def cancel_all_buys(client, orders: list[dict], exchange_of, reason: str) -> None:
+    """대기 매수 전부에 취소를 요청한다"""
     for order in buys(orders):
         _cancel(client, order, exchange_of, reason)
-    return [order for order in orders if _key(order) not in _rejected]
