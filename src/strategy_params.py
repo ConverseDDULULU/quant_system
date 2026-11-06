@@ -31,6 +31,7 @@ PARAM_SPECS = {
     "max_overnight_holds": (2, 0, 3, 1, "오버나잇 홀딩 최대 종목 수"),
     "min_order_usd": (25, 10, 60, 5, "1회 최소 매수 금액($)"),
     "open_entry_delay_min": (15, 0, 30, 5, "개장 후 신규 매수 금지 시간(분)"),
+    "pending_buy_timeout_sec": (180, 60, 600, 30, "미체결 매수 취소까지 기다리는 시간(초)"),
 }
 
 

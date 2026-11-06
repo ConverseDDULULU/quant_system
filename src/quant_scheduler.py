@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 import warnings
 import pytz
 import bear_mode
+import pending_orders
 import sector_guard
 import daily_review
 import strategy_params
@@ -313,9 +314,20 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
     balance_res = client.get_balance()
     holdings = balance_res.get("result_list", [])
 
+    # 대기 주문: 키움 미체결 조회로 매 사이클 다시 읽는다 (조회 실패 시 직전 목록 유지, 신규 매수만 쉼)
+    exchange_of = lambda t: get_exchange_code(client, t)
+    pending, pending_ok = [], True
+    if not dry_run:
+        session = session_bounds(now_ny().date())
+        pending, pending_ok = pending_orders.fetch(
+            client, session[0].astimezone(pending_orders.KST) if session else None
+        )
+
     if is_market_closing_time():
+        # 청산 뒤에 매수가 체결돼 의도치 않게 밤을 넘기지 않도록 대기 매수를 먼저 모두 취소
+        pending = pending_orders.cancel_all_buys(client, pending, exchange_of, "장마감 청산 전")
         if holdings:
-            liquidate_all_positions(client, holdings)
+            liquidate_all_positions(client, holdings, pending_orders.sell_tickers(pending))
             print(
                 "💤 장마감 청산 주문 처리를 마쳤습니다. 실제 체결은 계좌 잔고에서 확인하세요."
             )
@@ -359,6 +371,11 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
         current_equity = account_equity_usd(client, usd_available, holdings)
         risk_state = get_circuit_breaker_status(current_equity)
         INITIAL_BALANCE = risk_state["starting_balance"] or current_equity
+    pending = pending_orders.cancel_expired_buys(
+        client, pending, PARAMS["pending_buy_timeout_sec"], exchange_of
+    )
+    pending_sells = pending_orders.sell_tickers(pending)
+
     # 1단계: 보유 종목 동적 익절/손절 감시
     held_tickers = []
 
@@ -378,6 +395,10 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
             print(
                 f"   📊 [{ticker:4s}] 보유: {qty}주 | 매입단가: ${buy_price:.2f} | 현재가: ${now_price:.2f} | 수익률: {profit_rate:+.2f}%"
             )
+
+            if ticker in pending_sells:
+                print(f"   ⏳ [매도 대기 중] {ticker}: 체결을 기다리며 매도 주문을 다시 내지 않음")
+                continue
 
             is_sell_triggered = False
             sell_reason = ""
@@ -482,6 +503,18 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
     if breaker["blocked"]:
         print(f"🛑 [일일 서킷브레이커] 신규 매수 차단: {breaker['reason']}")
         return
+
+    if not pending_ok:
+        print("⏸️ [대기 주문 확인 불가] 이번 사이클 신규 매수를 쉽니다.")
+        return
+
+    # 대기 매수도 보유로 계산: 보유 한도, 인버스 한 종목, 업종 중복, 쓸 수 있는 현금에 반영
+    pending_buys = pending_orders.buy_tickers(pending)
+    if pending_buys:
+        reserved = pending_orders.reserved_cash(pending)
+        usd_available = max(0.0, usd_available - reserved)
+        print(f"⏳ [대기 매수] {', '.join(pending_buys)} (묶인 금액 ${reserved:.2f}, 남은 현금 ${usd_available:.2f})")
+        held_tickers.extend(t for t in pending_buys if t not in held_tickers)
 
     # 개장 직후 N분은 변동성·호가 차이가 크고 거래량 배수가 부풀어 신규 매수(인버스 포함)를 하지 않는다.
     # 손절·익절·청산은 위 1단계에서 이미 처리돼 영향 없음
@@ -712,8 +745,8 @@ def _momentum_continues(client, ticker: str) -> bool:
     return bool(analysis and analysis.get("momentum_continues", False))
 
 
-def liquidate_all_positions(client, held_positions: list):
-    """장마감 전 보유 종목 일괄 청산 (스마트 홀딩 조건 충족 종목은 오버나잇 유지)"""
+def liquidate_all_positions(client, held_positions: list, pending_sells: set = frozenset()):
+    """장마감 전 보유 종목 일괄 청산 (스마트 홀딩 조건 충족 종목은 오버나잇 유지, 대기 매도가 있으면 다시 내지 않음)"""
     global HOLD_NOTICE_DATE
     if not held_positions:
         return
@@ -759,6 +792,9 @@ def liquidate_all_positions(client, held_positions: list):
         ticker = item.get("stk_cd") or item.get("symbol")
         if ticker in hold_decisions:
             print(f"  🌙 [오버나잇 홀딩] {ticker}: {hold_decisions[ticker]['reason']}")
+            continue
+        if ticker in pending_sells:
+            print(f"  ⏳ [매도 대기 중] {ticker}: 체결을 기다리며 청산 주문을 다시 내지 않음")
             continue
         qty = 0
         for key in ("poss_qty", "rmnd_qty", "qty"):
