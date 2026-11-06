@@ -45,6 +45,7 @@ INITIAL_BALANCE = None  # 장 시작 시 최초 1회 기록
 DAILY_COMPLETED_TRADES = []  # 오늘 청산된 종목 누적 리스트
 TODAY_BOUGHT = []  # 오늘 매수 주문이 접수된 종목 (업종 중복 검사용)
 LAST_SCAN_AT = None  # 마지막 후보 스캔 시각 (time.monotonic)
+SELL_REJECT_LOGGED = set()  # 매도 거절 로그를 이미 남긴 종목 (30초마다 반복 출력 방지)
 CURRENT_TRADING_DATE = None  # 뉴욕 기준 거래일 (바뀌면 당일 상태 초기화)
 SUMMARY_SENT_DATE = None  # 일일 결산을 이미 보낸 거래일
 HOLD_NOTICE_DATE = None  # 오버나잇 홀딩 판정 알림을 보낸 거래일
@@ -289,6 +290,28 @@ def get_exchange_code(client: KiwoomClient, ticker: str) -> str:
     return "UNKNOWN"
 
 
+def _submit_sell(client, ticker, qty, price, exchange, label) -> dict:
+    """매도 주문. 거절·오류는 예외 없이 응답으로 돌려주고, 거절 로그는 접수될 때까지 종목당 한 번만 남긴다
+
+    대기 매도 차단 시간이 지나 다시 낸 주문은 수량이 묶여 있으면 키움이 거절한다. 매매 기록과 손절 횟수는
+    호출한 쪽에서 return_code 0일 때만 남긴다.
+    """
+    try:
+        res = client.order_us_stock(
+            ticker=ticker, order_type="SELL", qty=qty, price=price, exchange=exchange
+        ) or {}
+    except Exception as e:
+        res = {"return_code": -1, "return_msg": f"{type(e).__name__}: {e}"}
+    code, msg = res.get("return_code", -1), res.get("return_msg", "응답 없음")
+    if str(code) == "0":
+        SELL_REJECT_LOGGED.discard(ticker)
+        print(f"   ➔ {label} 응답 {ticker} ({exchange}): [{code}] {msg}")
+    elif ticker not in SELL_REJECT_LOGGED:
+        SELL_REJECT_LOGGED.add(ticker)
+        print(f"   ⚠️ [매도 거절] {label} {ticker} ({exchange}): [{code}] {msg} (다음 점검에 다시 판단, 이 로그는 한 번만)")
+    return res
+
+
 def _check_pending_orders(client, closing: bool, dry_run: bool) -> tuple[list, bool, set]:
     """(대기 주문, 조회 성공 여부, 대기 매도 종목)
 
@@ -467,18 +490,8 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
                     # 익절 대기 상태가 아닌 손절에서는 위에서 거래소 코드를 조회하지 않으므로 여기서 확정
                     exchange_code = get_exchange_code(client, ticker)
                     sell_target_price = format_us_price(now_price * 0.99)
-                    res = client.order_us_stock(
-                        ticker=ticker,
-                        order_type="SELL",
-                        qty=qty,
-                        price=sell_target_price,
-                        exchange=exchange_code,
-                    )
+                    res = _submit_sell(client, ticker, qty, sell_target_price, exchange_code, "키움 실계좌 매도 접수")
                     return_code = res.get("return_code", -1)
-                    return_msg = res.get("return_msg", "응답 없음")
-                    print(
-                        f"   ➔ 키움 실계좌 매도 접수 응답 ({exchange_code}): [{return_code}] {return_msg}"
-                    )
 
                     if str(return_code) == "0":
                         clear_position_exit_state(position_key)
@@ -857,17 +870,8 @@ def liquidate_all_positions(client, held_positions: list, pending_sells: set = f
         sell_target_price = format_us_price(curr_price * 0.99)
 
         print(f"  ➔ [마감 일괄 청산] {ticker} {qty}주 매도 발송 중...")
-        res = client.order_us_stock(
-            ticker=ticker,
-            order_type="SELL",
-            qty=qty,
-            price=sell_target_price,
-            exchange=exchange_code,
-        )
-
+        res = _submit_sell(client, ticker, qty, sell_target_price, exchange_code, "마감 청산")
         code = res.get("return_code", -1)
-        msg = res.get("return_msg", "응답 없음")
-        print(f"  ➔ {ticker} 마감 청산 응답: [{code}] {msg}")
         if str(code) == "0":
             accepted_orders += 1
             record_ticker_sell(ticker)

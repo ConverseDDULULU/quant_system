@@ -18,12 +18,14 @@ import pytz
 
 KST = pytz.timezone("Asia/Seoul")
 SLOW_SELL_WARN_SECONDS = 120
+SELL_BLOCK_SECONDS = 180  # 대기 매도가 재주문을 막는 최대 시간 (손절이 무기한 막히지 않게)
 SESSION_MARGIN_SECONDS = 60
 CANCEL_RETRY_SECONDS = 60  # 취소가 접수됐는데도 목록에 남아 있으면 다시 요청하는 간격
 
 _known: dict[tuple, dict] = {}  # 직전에 알던 대기 주문
 _cancel_requested: dict[tuple, float] = {}  # 취소를 접수한 주문 -> 접수 시각 (time.monotonic)
 _cancel_failed_logged: set[tuple] = set()  # 취소 실패 로그를 이미 남긴 주문 (사이클마다 반복 출력 방지)
+_block_lifted_logged: set[tuple] = set()  # 차단 해제 로그를 이미 남긴 대기 매도
 
 
 def _key(order: dict) -> tuple:
@@ -34,6 +36,7 @@ def reset_state() -> None:
     _known.clear()
     _cancel_requested.clear()
     _cancel_failed_logged.clear()
+    _block_lifted_logged.clear()
 
 
 def known_orders() -> list[dict]:
@@ -93,6 +96,7 @@ def fetch(client, session_start: datetime | None = None, now: datetime | None = 
             continue
         cancel_requested = _cancel_requested.pop(key, None) is not None
         _cancel_failed_logged.discard(key)
+        _block_lifted_logged.discard(key)
         if cancel_requested:
             print(f"⏱️ [대기 주문 취소 확인] {order['ticker']} {order['side']} {order['unfilled_qty']}주 미체결 목록에서 사라짐")
             continue
@@ -114,7 +118,23 @@ def buy_tickers(orders: list[dict]) -> list[str]:
 
 
 def sell_tickers(orders: list[dict]) -> set[str]:
-    return {order["ticker"] for order in orders if order["side"] == "SELL"}
+    """매도 주문을 다시 내지 않을 종목: 나이를 알고 SELL_BLOCK_SECONDS 안인 대기 매도만
+
+    미체결 조회의 실제 동작을 믿고 무기한 막으면, 사라지지 않는 행 하나로 손절이 멈춘다.
+    나이를 모르거나 한도를 넘긴 매도는 막지 않는다. 수량이 묶여 있으면 키움이 거절할 뿐 이중 매도는 나지 않는다.
+    """
+    blocked = set()
+    for order in orders:
+        if order["side"] != "SELL":
+            continue
+        age = order.get("age_seconds")
+        if age is not None and age < SELL_BLOCK_SECONDS:
+            blocked.add(order["ticker"])
+        elif _key(order) not in _block_lifted_logged:
+            _block_lifted_logged.add(_key(order))
+            reason = "주문시간 미상" if age is None else f"{age:.0f}초 경과"
+            print(f"⚠️ [대기 매도 차단 해제] {order['ticker']} {order.get('unfilled_qty')}주 {reason}: 손절·익절 판단을 다시 진행")
+    return blocked
 
 
 def reserved_cash(orders: list[dict]) -> float:
