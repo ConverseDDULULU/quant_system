@@ -255,6 +255,145 @@ class KiwoomClient:
             rows = [rows]
         return [row for row in rows if isinstance(row, dict)]
 
+    def get_us_open_orders(self, ord_dt: str = "", max_pages: int = 10) -> list | None:
+        """미국주식 미체결 주문(ust21050)을 정규화해서 돌려준다.
+
+        반환: 조회 실패·응답 해석 불가·페이지를 끝까지 못 읽음은 None, 미체결 없음은 [].
+        None을 "미체결 없음"으로 처리하면 대기 주문을 놓치니 호출한 쪽에서 구분해야 한다.
+        행: order_no, orig_order_no, ticker, side(BUY/SELL), order_qty, filled_qty,
+        unfilled_qty, order_price, exchange, order_kind(10 원주문, 11 정정), status,
+        order_time(KST), cancel_pending(이 주문에 대한 취소가 접수됨), raw(키움 원본 행)
+        exchange: 응답에 거래소 코드가 없어(stex_nm="미국") 종목 마스터에서 찾는다. 못 찾으면 "".
+        """
+        self._ensure_token()
+        url = f"{self.base_url}/api/us/acnt"
+        body = {"ord_dt": ord_dt, "slby_tp": "0", "stex_tp": "", "stk_cd": ""}
+        rows = []
+        cont_yn = "N"
+        next_key = ""
+
+        for _ in range(max_pages):
+            headers = {
+                "Content-Type": "application/json;charset=UTF-8",
+                "authorization": f"Bearer {self.access_token}",
+                "api-id": "ust21050",
+            }
+            if cont_yn == "Y" and next_key:
+                headers["cont-yn"] = cont_yn
+                headers["next-key"] = next_key
+            try:
+                res = self._post(url, headers=headers, json=body, timeout=10)
+                data = res.json()
+            except Exception as e:
+                print(f"⚠️ 미체결(ust21050) 조회 실패: {e}")
+                return None
+            if res.status_code != 200 or not isinstance(data, dict) or str(data.get("return_code")) != "0":
+                detail = data if not isinstance(data, dict) else f"[{data.get('return_code')}] {data.get('return_msg', '응답 없음')}"
+                print(f"⚠️ 미체결(ust21050) 오류: HTTP {res.status_code} {detail}")
+                return None
+
+            page_rows = data.get("result_list") or []
+            if isinstance(page_rows, dict):
+                page_rows = [page_rows]
+            if not isinstance(page_rows, list) or not all(isinstance(r, dict) for r in page_rows):
+                print(f"⚠️ 미체결(ust21050) 응답 형식 오류: {type(page_rows).__name__}")
+                return None
+            rows.extend(page_rows)
+
+            cont_yn = res.headers.get("cont-yn", "N").upper()
+            next_key = res.headers.get("next-key", "")
+            if cont_yn != "Y" or not next_key:
+                break
+            time.sleep(0.2)
+        else:
+            print(f"⚠️ 미체결(ust21050) {max_pages}페이지를 넘어 끝까지 읽지 못했습니다.")
+            return None
+
+        # 취소 주문(12)도 행으로 나온다. 다시 취소하지 않도록 빼고, 대상 원주문에 표시만 한다.
+        cancel_targets = {
+            str(r.get("orig_ord_no", "")).strip() for r in rows if str(r.get("ord_cntr_tp", "")).strip() == "12"
+        }
+        orders = []
+        exchange_by_ticker = {}
+        for row in rows:
+            if str(row.get("ord_cntr_tp", "")).strip() == "12":
+                continue
+            try:
+                order_no = str(row["ord_no"]).strip()
+                ticker = str(row["stk_cd"]).strip().upper()
+                side = {"1": "SELL", "2": "BUY"}[str(row["slby_tp"]).strip()]
+                unfilled_qty = int(float(str(row["ord_remnq"]).replace(",", "").strip()))
+                order_qty = int(float(str(row["ord_qty"]).replace(",", "").strip()))
+                if not order_no or not ticker:
+                    raise ValueError("주문번호 또는 종목코드 없음")
+            except (KeyError, TypeError, ValueError) as e:
+                # 해석 못 한 행을 버리면 대기 주문을 "없음"으로 잘못 알릴 수 있다
+                print(f"⚠️ 미체결(ust21050) 행 해석 실패: {e!r} / {row}")
+                return None
+            if unfilled_qty <= 0:
+                continue
+            if ticker not in exchange_by_ticker:
+                try:
+                    exchange_by_ticker[ticker] = self.get_us_exchange_code(ticker)
+                except Exception as e:
+                    print(f"⚠️ {ticker} 거래소 코드 조회 실패: {e}")
+                    exchange_by_ticker[ticker] = ""
+            orders.append(
+                {
+                    "order_no": order_no,
+                    "orig_order_no": str(row.get("orig_ord_no", "")).strip(),
+                    "ticker": ticker,
+                    "side": side,
+                    "order_qty": order_qty,
+                    "filled_qty": int(safe_float(row.get("cntr_qty"))),
+                    "unfilled_qty": unfilled_qty,
+                    "order_price": safe_float(row.get("ord_uv")),
+                    "exchange": exchange_by_ticker[ticker],
+                    "order_kind": str(row.get("ord_cntr_tp", "")).strip(),
+                    "status": str(row.get("ord_stat", "")).strip(),
+                    "order_time": str(row.get("ord_time", "")).strip(),
+                    "cancel_pending": order_no in cancel_targets,
+                    "raw": row,
+                }
+            )
+        return orders
+
+    def cancel_us_order(self, order_no: str, ticker: str, exchange: str) -> dict:
+        """미국주식 주문 취소(ust20003). 남은 수량 전부를 취소한다 (문서상 수량 입력 없음).
+
+        키움 응답을 그대로 돌려준다. return_code로 구분한다:
+          0   취소 접수 (취소 완료가 아니다. 그 사이 체결될 수 있어 미체결·잔고를 다시 봐야 한다)
+          그 외 양수  키움이 거절 (이미 체결된 주문 등. 문서에 전용 오류코드가 없어 메시지로만 알 수 있다)
+          -1  보내기 전에 막음 (입력값 오류). 취소 요청이 나가지 않았다
+          -2  보낸 뒤 응답을 못 받음. 취소됐는지 알 수 없으니 미체결을 다시 조회해야 한다
+        """
+        order_no = str(order_no or "").strip()
+        ticker = str(ticker or "").upper().strip()
+        exchange = str(exchange or "").upper().strip()
+        if not order_no.strip("0"):
+            return {"return_code": -1, "return_msg": f"취소할 주문번호가 없습니다: {order_no!r}"}
+        if not ticker or exchange not in {"ND", "NY", "NA"}:
+            return {"return_code": -1, "return_msg": f"종목·거래소를 확인할 수 없습니다: {ticker} ({exchange or 'UNKNOWN'})"}
+
+        self._ensure_token()
+        headers = {
+            "Content-Type": "application/json;charset=UTF-8",
+            "authorization": f"Bearer {self.access_token}",
+            "api-id": "ust20003",
+        }
+        body = {"orig_ord_no": order_no, "stex_tp": exchange, "stk_cd": ticker}
+        print(f"🚫 [키움 주문 취소] {ticker} 주문번호 {order_no} (TR: ust20003)")
+        try:
+            res = self._post(f"{self.base_url}/api/us/ordr", headers=headers, json=body, timeout=10)
+            data = res.json()
+        except Exception as e:
+            print(f"⚠️ 주문 취소 응답 없음 (취소 여부 불명): {e}")
+            return {"return_code": -2, "return_msg": str(e)}
+        print(f"📦 [키움 취소 원본 응답]: {data}")
+        if not isinstance(data, dict) or "return_code" not in data:
+            return {"return_code": -2, "return_msg": f"응답 해석 불가: HTTP {res.status_code} {data}"}
+        return data
+
     def get_balance(self) -> dict:
         """스케줄러 호환 잔고 리스트 반환"""
         return {"result_list": self.get_us_holdings()}
