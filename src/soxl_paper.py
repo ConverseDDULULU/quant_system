@@ -262,19 +262,21 @@ def run_once(now: datetime | None = None, notify=send_discord) -> None:
         return
     today = now.date().isoformat()
     last = pd.Timestamp(state["last_bar"]) if state["last_bar"] else None
-    if last is not None and last.date().isoformat() == today:
+    if last is not None and last >= base.index[0]:
+        # 받은 5일 봉 안에 마지막 처리 봉이 있으면 날짜와 상관없이 그다음 봉부터 이어서 처리
+        # (전날 마감 전에 멈췄어도 전날 남은 봉에서 '마감 정리'로 닫혀 기록이 남는다)
         start = int(base.index.searchsorted(last, side="right"))
-        catch_up = False
     else:
-        # 처음 실행했거나 지난 장 기록이면 오늘 첫 봉부터 다시 처리 (이미 끝난 지난 포지션은 정리됨)
-        if state["position"] and state["day"] != today:
-            print("⚠️ [SOXL 모의] 지난 장 포지션이 정리되지 않은 채 남아 있어 오늘 처리 전에 비웁니다")
+        # 처음 실행했거나 기록이 받은 봉보다 오래됐으면 오늘 첫 봉부터 처리
+        if state["position"]:
+            print("⚠️ [SOXL 모의] 마지막 처리 봉이 받은 데이터보다 오래돼 남은 포지션을 기록 없이 비웁니다")
             state["position"] = None
+        state["pending"] = None
         todays = np.flatnonzero(np.array([ts.date().isoformat() == today for ts in base.index]))
         if not len(todays):
             return
         start = int(todays[0])
-        catch_up = start < len(base) - 1
+    catch_up = start < len(base) - 1
     process_bars(state, base, etfs, start, make_event_handler(notify, catch_up))
     save_state(state)
 
