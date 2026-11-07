@@ -1,0 +1,21 @@
+[Unit]
+Description=SOXL paper trading (no real orders, yfinance only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__APP_USER__
+WorkingDirectory=__APP_DIR__
+Environment=PYTHONPATH=src:.
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+ExecStart=__APP_DIR__/.venv/bin/python src/soxl_paper.py
+Restart=always
+RestartSec=30
+# 실계좌 엔진(quant-scheduler)이 먼저 자원을 쓰도록 우선순위를 낮추고 메모리 상한을 둔다
+Nice=10
+MemoryMax=400M
+
+[Install]
+WantedBy=multi-user.target

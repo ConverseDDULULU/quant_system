@@ -95,6 +95,17 @@ gcloud compute ssh <VM이름> --zone asia-northeast3-a -- -L 8000:localhost:8000
 | 자동 분석 끄기 | `sudo systemctl disable --now claude-review.timer` |
 | 수치 변경 되돌리기 | `cd quant_system && PYTHONPATH=src:. .venv/bin/python src/strategy_params.py rollback` |
 
+### SOXL 모의 매매 (실주문 없음)
+
+`src/soxl_paper.py`는 키움을 쓰지 않고 yfinance 5분봉만으로 SOXL·SOXS 단타를 모의로 기록해요. 디스코드 알림에는 `🧪 [모의]`가 붙어요. 실계좌 엔진과는 별도 서비스(`quant-soxl-paper`)이고, `update.sh`는 이 서비스가 등록된 경우에만 함께 재시작해요.
+
+| 하고 싶은 것 | 명령 (서버) |
+|---|---|
+| 처음 등록 | `cd quant_system && bash deploy/setup_soxl_paper.sh` |
+| 로그 | `journalctl -u quant-soxl-paper -f` |
+| 누적 성적 | `cd quant_system && PYTHONPATH=src:. .venv/bin/python src/soxl_paper.py --report` |
+| 끄기 | `sudo systemctl disable --now quant-soxl-paper` |
+
 ## 8. 노트북(두 번째 PC)에서 작업하기
 
 실제 매매는 서버에서 돌아요. PC에 묶여 있는 건 Claude 작업 환경(코드, gcloud 로그인 등)뿐이라, 노트북에도 같은 환경을 만들면 PC 없이 관리할 수 있어요.
