@@ -95,6 +95,54 @@ gcloud compute ssh <VM이름> --zone asia-northeast3-a -- -L 8000:localhost:8000
 | 자동 분석 끄기 | `sudo systemctl disable --now claude-review.timer` |
 | 수치 변경 되돌리기 | `cd quant_system && PYTHONPATH=src:. .venv/bin/python src/strategy_params.py rollback` |
 
+## 8. 노트북(두 번째 PC)에서 작업하기
+
+실제 매매는 서버에서 돌아요. PC에 묶여 있는 건 Claude 작업 환경(코드, gcloud 로그인 등)뿐이라, 노트북에도 같은 환경을 만들면 PC 없이 관리할 수 있어요.
+
+### 방법 1 (추천): 노트북을 작업 PC로 만들기
+
+명령은 노트북의 터미널에서 직접 실행해요. 결과를 Claude에게 붙여 줄 때 토큰이나 키가 보이면 지우고 보내요.
+
+1. **설치** (윈도우). 설치가 끝나면 터미널을 새로 열어요.
+   ```bash
+   winget install Git.Git Google.CloudSDK
+   ```
+2. **코드 받기**
+   ```bash
+   git clone https://github.com/ConverseDDULULU/quant_system.git
+   ```
+3. **GCP 로그인**: 브라우저가 열리면 서버를 관리하는 구글 계정(`qwer`로 시작하는 Gmail)을 골라요.
+   ```bash
+   gcloud auth login
+   ```
+   ```bash
+   gcloud config set project project-335ea45f-10a3-467d-8ff
+   ```
+4. **서버 접속 확인**: `active`가 두 줄 나오면 성공이에요. 처음 접속할 때는 SSH 키를 만들어요. 노트북 사용자 이름이 한글이면 경고가 나와도 계정 이름으로 접속돼요.
+   ```bash
+   gcloud compute ssh quant-server --zone asia-northeast3-a --command "systemctl is-active quant-scheduler quant-api"
+   ```
+5. **Claude 앱 연결**: Code 탭에서 받은 `quant_system` 폴더를 열어요. `CLAUDE.md`의 역할·안전 규칙이 그대로 적용돼요.
+6. **GitHub push**: 첫 push 때 Git Credential Manager가 GitHub 로그인을 물어요. push는 사용자가 승인한 뒤에만 해요.
+
+PC와 노트북에서 번갈아 작업하면, 시작 전에 항상 최신 코드를 받아요.
+
+```bash
+git pull --ff-only origin main
+```
+
+**하지 말 것**
+
+- `config/.env`(키움·디스코드·Gemini 키)를 노트북에 복사하지 않아요. 서버 관리에는 필요 없어요.
+- `run_all.bat`의 매매 엔진을 켜지 않아요. 서버와 같은 계좌로 주문이 두 번 나가요.
+- 노트북에서 `KiwoomClient`로 로그인하는 스크립트를 돌리지 않아요. 같은 앱키로 로그인하면 서버 엔진의 토큰이 끊길 수 있어요.
+
+**옮겨 가지 않는 것**: 대화 기록, 예약 작업, Claude 메모리는 PC에 남아요. 중요한 운영 규칙은 `CLAUDE.md`와 이 문서에 있어요.
+
+### 방법 2: Remote Control로 PC 세션 이어 쓰기
+
+Claude 앱의 Remote Control로 PC에서 돌고 있는 세션을 노트북에서 이어 써요. 노트북에 따로 설치할 게 없고 대화 기록도 그대로지만, 명령은 PC에서 실행되므로 **PC가 켜져 있어야 해요.**
+
 ## ⚠️ 주의
 
 - **로컬 PC와 서버에서 동시에 엔진을 켜지 마세요.** 같은 계좌로 주문이 두 번 나갑니다. 서버 가동 후에는 `run_all.bat`의 매매 엔진(3번)을 실행하지 마세요.
