@@ -201,16 +201,32 @@ def _close_position(state: dict, exit_px: float, reason: str, ts, on_event) -> N
 
 # ---------- 실행 ----------
 
-def fetch_frames(now: datetime) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]] | None:
-    frames = {}
-    for ticker in (BASE, LONG, INVERSE):
+FETCH_RETRY_WAITS = (5, 10)  # yfinance가 잠깐 빈 결과를 줄 때 다시 시도하기 전 기다리는 초 (실패할 때만)
+
+
+def _history(ticker: str, sleep=time_mod.sleep) -> pd.DataFrame | None:
+    """5분봉 조회. 예외·빈 결과면 FETCH_RETRY_WAITS 간격으로 다시 시도 (11/10 SOXX 'possibly delisted' 3회)"""
+    last_error = "빈 결과"
+    for attempt, wait in enumerate((0,) + FETCH_RETRY_WAITS):
+        if wait:
+            sleep(wait)
         try:
             df = yf.Ticker(ticker).history(period="5d", interval="5m", prepost=False, auto_adjust=False)
         except Exception as e:
-            print(f"⚠️ [SOXL 모의] {ticker} 분봉 조회 실패: {type(e).__name__}: {e}")
-            return None
-        if df is None or df.empty:
-            print(f"⚠️ [SOXL 모의] {ticker} 분봉 없음")
+            df, last_error = None, f"{type(e).__name__}: {e}"
+        if df is not None and not df.empty:
+            if attempt:
+                print(f"ℹ️ [SOXL 모의] {ticker} 분봉 {attempt}번 재시도 끝에 받음")
+            return df
+    print(f"⚠️ [SOXL 모의] {ticker} 분봉 없음 ({len(FETCH_RETRY_WAITS)}번 재시도 실패, {last_error}): 이번 처리 건너뜀, 다음 실행 때 밀린 봉부터 처리")
+    return None
+
+
+def fetch_frames(now: datetime) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]] | None:
+    frames = {}
+    for ticker in (BASE, LONG, INVERSE):
+        df = _history(ticker)
+        if df is None:
             return None
         df = df.tz_convert(NY_TZ)
         df = df[df.index + BAR + BAR_SETTLE <= now]  # 아직 안 끝난 봉 제외
