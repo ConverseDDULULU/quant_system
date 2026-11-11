@@ -65,8 +65,8 @@ from src.kiwoom_client import KiwoomClient
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 
-HOLDING_CHECK_SECONDS = 30  # 보유 종목 손절·익절·청산 점검 간격 (30초 아래로 내리지 않는다)
-SCAN_INTERVAL_SECONDS = 55  # 후보 스캔·신규 매수 최소 간격 (점검 2번에 1번, 약 60초마다)
+HOLDING_CHECK_SECONDS = 20  # 보유 종목 손절·익절·청산 점검 간격 (20초 아래로 내리지 않는다, 사용자 결정 2026-11-11)
+SCAN_INTERVAL_SECONDS = 55  # 후보 스캔·신규 매수 최소 간격 (점검 3번에 1번, 약 60초마다)
 BUY_EXCHANGES = {"ND", "NY"}  # 신규 매수 허용 거래소 (NASDAQ, NYSE)
 AGGRESSIVE_RSI_MAX = 65.0  # 공격 모드에서도 이 값보다 RSI가 높으면(과열) 매수하지 않음
 
