@@ -21,7 +21,7 @@ STOP_LOSS_PCT = -1.8
 TAKE_PROFIT_PCT = 3.5
 MAX_TAKE_PROFIT_PCT = 7.0
 MAX_POSITION_FRACTION = 0.5  # 한 종목 매수 금액 상한: 계좌 평가액의 1/2
-KNOWN_EXCHANGE_CODES = {"GRAB": "ND", "RIOT": "ND", "SOXL": "NA"}
+KNOWN_EXCHANGE_CODES = {"GRAB": "ND", "RIOT": "ND", "SOXL": "NA", "SOXS": "NA"}  # SOXL·SOXS는 NYSE Arca → 키움 NA (soxl_live.EXCHANGE와 같게)
 
 _market_cache_lock = threading.Lock()
 _market_cache_time = 0.0

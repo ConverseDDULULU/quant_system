@@ -29,6 +29,10 @@ def safe_float(val, default: float = 0.0) -> float:
         return default
 
 
+# AMEX(NA)에서 매수를 허용하는 종목 (그 밖의 NA 종목은 매수 차단, 매도는 거래소와 무관하게 허용)
+AMEX_BUY_TICKERS = frozenset({"SOXL", "SOXS"})
+
+
 class KiwoomClient:
     """키움증권 REST Open API 실서버 클라이언트 (미국주식 전문)"""
 
@@ -834,11 +838,11 @@ class KiwoomClient:
                 "return_code": -1,
                 "return_msg": f"거래소 확인 불가로 주문을 차단했습니다: {ticker} ({exchange_code or 'UNKNOWN'})",
             }
-        is_soxl_amex = ticker.upper().strip() == "SOXL" and exchange_code == "NA"
-        if is_buy and exchange_code not in {"ND", "NY"} and not is_soxl_amex:
+        is_allowed_amex = ticker.upper().strip() in AMEX_BUY_TICKERS and exchange_code == "NA"
+        if is_buy and exchange_code not in {"ND", "NY"} and not is_allowed_amex:
             return {
                 "return_code": -1,
-                "return_msg": f"NASDAQ·NYSE 또는 SOXL(NA)만 매수할 수 있습니다: {ticker} (거래소 {exchange_code})",
+                "return_msg": f"NASDAQ·NYSE 또는 SOXL·SOXS(NA)만 매수할 수 있습니다: {ticker} (거래소 {exchange_code})",
             }
 
         self._ensure_token()
