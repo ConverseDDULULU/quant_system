@@ -11,6 +11,8 @@
   (이미 체결된 주문은 잔량이 없어 다음 조회에서 저절로 빠진다)
 """
 
+import json
+import os
 import time
 from datetime import datetime, timedelta
 
@@ -27,12 +29,65 @@ _cancel_requested: dict[tuple, float] = {}  # 취소를 접수한 주문 -> 접�
 _cancel_failed_logged: set[tuple] = set()  # 취소 실패 로그를 이미 남긴 주문 (사이클마다 반복 출력 방지)
 _block_lifted_logged: set[tuple] = set()  # 차단 해제 로그를 이미 남긴 대기 매도
 
+# 미체결 조회(ust21050) ord_dt의 날짜 기준. 문서에는 "미입력시 오늘"뿐이라 한국 자정 뒤 주문이 한국 날짜(kst)로
+# 잡히는지 개장일(ny, 뉴욕 거래일 = 개장 시각의 한국 날짜)로 잡히는지 모른다.
+# 모르는 동안은 자정 뒤 두 날짜를 다 조회하고, 자정 뒤 주문이 어느 날짜에서 나오는지 보면 기억해 한 날짜만 조회한다.
+BASIS_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "ust21050_date_basis.json")
+MIDNIGHT_GRACE_SECONDS = 600  # kst 기준일 때 자정 직후 10분은 어제 날짜도 조회 (자정 직전에 낸 주문을 놓치지 않게)
+_basis: str | None = None
+_basis_loaded = False
+
+
+def date_basis() -> str | None:
+    """"kst" | "ny" | None(아직 모름)"""
+    global _basis, _basis_loaded
+    if not _basis_loaded:
+        _basis_loaded = True
+        try:
+            with open(BASIS_PATH, encoding="utf-8") as f:
+                value = json.load(f).get("basis")
+            _basis = value if value in ("kst", "ny") else None
+        except (OSError, ValueError, AttributeError):
+            _basis = None
+    return _basis
+
+
+def _learn_basis(value: str, evidence: str) -> None:
+    global _basis, _basis_loaded
+    _basis, _basis_loaded = value, True
+    print(f"📌 [미체결 조회 날짜 기준] {value}로 확인: {evidence} → 이제 한 날짜만 조회")
+    try:
+        os.makedirs(os.path.dirname(BASIS_PATH), exist_ok=True)
+        with open(BASIS_PATH, "w", encoding="utf-8") as f:
+            json.dump({"basis": value, "evidence": evidence, "learned_at": datetime.now(KST).isoformat()}, f, ensure_ascii=False)
+    except OSError as e:
+        print(f"⚠️ [미체결 조회 날짜 기준] 저장 실패(재시작하면 다시 확인): {e}")
+
+
+def _query_days(session_start: datetime | None, now: datetime) -> list[datetime]:
+    """이번 점검에 조회할 날짜. 자정 전이거나 기준을 알면 대부분 1개"""
+    if session_start is None or session_start.date() == now.date():
+        return [now]
+    yesterday = now - timedelta(days=1)
+    basis = date_basis()
+    if basis == "ny":
+        return [session_start]
+    if basis == "kst":
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        carry = any(o.get("query_date") == yesterday.strftime("%Y%m%d") for o in _known.values())
+        if carry or (now - midnight).total_seconds() < MIDNIGHT_GRACE_SECONDS:
+            return [now, yesterday]  # 자정 전에 낸 주문이 아직 미체결일 수 있음
+        return [now]
+    return [now, yesterday]
+
 
 def _key(order: dict) -> tuple:
     return (order.get("order_no"), order.get("ticker"))
 
 
 def reset_state() -> None:
+    global _basis, _basis_loaded
+    _basis, _basis_loaded = None, False
     _known.clear()
     _cancel_requested.clear()
     _cancel_failed_logged.clear()
@@ -59,13 +114,12 @@ def order_age_seconds(order_time: str, now: datetime) -> float | None:
 def fetch(client, session_start: datetime | None = None, now: datetime | None = None) -> tuple[list[dict], bool]:
     """(대기 주문 목록, 조회 성공 여부). 실패하면 직전에 알던 목록을 그대로 돌려준다
 
-    정규장이 한국 자정을 넘고 "오늘"의 기준이 불분명해서 자정 이후에는 어제 날짜도 함께 조회한다.
+    정규장이 한국 자정을 넘는다. 조회 날짜 기준(kst/ny)을 모르는 동안은 자정 뒤 두 날짜를 다 조회하고,
+    알게 되면 한 날짜만 조회한다 (_query_days).
     이번 장 개장 전에 낸 주문은 지난 장의 기록으로 보고 뺀다.
     """
     now = now or datetime.now(KST)
-    days = [now]
-    if session_start is not None and session_start.date() != now.date():
-        days.append(now - timedelta(days=1))
+    days = _query_days(session_start, now)
 
     rows = []
     for day in days:
@@ -90,13 +144,13 @@ def fetch(client, session_start: datetime | None = None, now: datetime | None = 
         order["age_seconds"] = order_age_seconds(order.get("order_time"), now)
         if max_age is not None and order["age_seconds"] is not None and order["age_seconds"] > max_age:
             continue
-        if _key(order) not in _known and len(days) > 1:
-            # 미체결 조회 날짜 기준(한국/뉴욕) 확인용: 확인되면 날짜 하나만 조회해 호출을 절반으로 줄인다
-            print(
-                f"ℹ️ [대기 주문 조회일] {order.get('ticker')} {order.get('side')} 주문시간 {order.get('order_time')} "
-                f"→ ord_dt={order.get('query_date')} 조회에서 나옴 (조회한 날짜: {', '.join(d.strftime('%Y%m%d') for d in days)})"
-            )
-        current[_key(order)] = order
+        key = _key(order)
+        if key in current and current[key].get("query_date") != order.get("query_date"):
+            order["seen_both_dates"] = True
+        current[key] = order
+
+    if date_basis() is None and len(days) == 2 and session_start is not None:
+        _try_learn_basis(current.values(), days, session_start, now)
 
     for key, order in _known.items():
         if key in current:
@@ -114,6 +168,26 @@ def fetch(client, session_start: datetime | None = None, now: datetime | None = 
     _known.clear()
     _known.update(current)
     return list(current.values()), True
+
+
+def _try_learn_basis(orders, days, session_start: datetime, now: datetime) -> None:
+    """두 날짜를 다 조회했을 때, 자정 뒤에 낸 주문이 어느 날짜에서 나왔는지로 기준을 정한다"""
+    today, yesterday = days[0].strftime("%Y%m%d"), days[1].strftime("%Y%m%d")
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    for order in orders:
+        age = order.get("age_seconds")
+        if age is None or order.get("seen_both_dates"):
+            continue  # 두 날짜 모두에서 나오면 ord_dt를 무시하는 것이라 판단 근거가 안 됨
+        placed = now - timedelta(seconds=age)
+        if placed < midnight + timedelta(seconds=5):
+            continue  # 자정 전 주문은 두 기준의 날짜가 같아 구분이 안 됨
+        evidence = f"{order.get('ticker')} 주문시간 {order.get('order_time')}(자정 뒤) → ord_dt={order.get('query_date')}"
+        if order.get("query_date") == today:
+            _learn_basis("kst", evidence)
+            return
+        if order.get("query_date") == yesterday == session_start.strftime("%Y%m%d"):
+            _learn_basis("ny", evidence)
+            return
 
 
 def buys(orders: list[dict]) -> list[dict]:
