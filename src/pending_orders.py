@@ -69,15 +69,16 @@ def fetch(client, session_start: datetime | None = None, now: datetime | None = 
 
     rows = []
     for day in days:
+        ord_dt = day.strftime("%Y%m%d")
         try:
-            result = client.get_us_open_orders(ord_dt=day.strftime("%Y%m%d"))
+            result = client.get_us_open_orders(ord_dt=ord_dt)
         except Exception as e:
             print(f"⚠️ [대기 주문 조회 실패] {type(e).__name__}: {e}")
             result = None
         if result is None:
             print("⚠️ [대기 주문 조회 실패] 직전 목록 유지, 이번 사이클 신규 매수 쉼")
             return known_orders(), False
-        rows.extend(result)
+        rows.extend(dict(row, query_date=ord_dt) for row in result)
 
     max_age = None
     if session_start is not None:
@@ -89,6 +90,12 @@ def fetch(client, session_start: datetime | None = None, now: datetime | None = 
         order["age_seconds"] = order_age_seconds(order.get("order_time"), now)
         if max_age is not None and order["age_seconds"] is not None and order["age_seconds"] > max_age:
             continue
+        if _key(order) not in _known and len(days) > 1:
+            # 미체결 조회 날짜 기준(한국/뉴욕) 확인용: 확인되면 날짜 하나만 조회해 호출을 절반으로 줄인다
+            print(
+                f"ℹ️ [대기 주문 조회일] {order.get('ticker')} {order.get('side')} 주문시간 {order.get('order_time')} "
+                f"→ ord_dt={order.get('query_date')} 조회에서 나옴 (조회한 날짜: {', '.join(d.strftime('%Y%m%d') for d in days)})"
+            )
         current[_key(order)] = order
 
     for key, order in _known.items():

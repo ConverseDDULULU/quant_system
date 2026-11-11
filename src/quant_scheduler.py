@@ -550,12 +550,12 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
     pending_buys = pending_orders.buy_tickers(pending)
     if pending_buys:
         reserved = pending_orders.reserved_cash(pending)
-        # 주문가능금액에 대기 금액이 이미 빠져 있으면 이중 차감(매수를 덜 하는 쪽). 첫 장 로그로 확인할 수 있게 함께 출력
+        # 키움 주문가능금액(외화)에는 대기 매수 금액이 이미 빠져 있어 다시 빼지 않는다
+        # (11/09 WULF: 주문 전 $109.63 → 주문 뒤 $48.18, 대기 $61.15를 또 빼서 $0이 됐음)
         print(
-            f"⏳ [대기 매수] {', '.join(pending_buys)} (주문가능 ${usd_available:.2f} - 대기 ${reserved:.2f} "
-            f"= ${max(0.0, usd_available - reserved):.2f}, 잠시 전 주문가능과 비교 필요)"
+            f"⏳ [대기 매수] {', '.join(pending_buys)} (대기 ${reserved:.2f}, "
+            f"주문가능 ${usd_available:.2f}는 키움이 이미 차감한 값)"
         )
-        usd_available = max(0.0, usd_available - reserved)
         held_tickers.extend(t for t in pending_buys if t not in held_tickers)
 
     # 개장 직후 N분은 변동성·호가 차이가 크고 거래량 배수가 부풀어 신규 매수(인버스 포함)를 하지 않는다.
@@ -902,7 +902,8 @@ def liquidate_all_positions(client, held_positions: list, pending_sells: set = f
                 net_pct = float(str(item.get("pl_rt", "")).replace(",", "").strip())
             except (TypeError, ValueError):
                 net_pct = None
-            _log_completed_trade(ticker, buy_price, curr_price, qty, "장마감청산", net_profit_pct=net_pct)
+            # 현재가가 아니라 실제로 낸 주문가로 기록 (실제 체결가는 장마감 결산 때 키움 실현손익 ust21630으로 덮어씀)
+            _log_completed_trade(ticker, buy_price, float(sell_target_price), qty, "장마감청산", net_profit_pct=net_pct)
         else:
             skipped_orders += 1
         time.sleep(1)

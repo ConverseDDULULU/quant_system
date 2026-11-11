@@ -19,10 +19,12 @@ FEE_RATE_PER_SIDE = float(os.getenv("KIWOOM_US_FEE_RATE", "0.0025"))
 
 # profit_usd·profit_pct는 수수료 전(가격 기준), net_*은 수수료·제세금 차감 후
 # fee_source: estimate(요율 추정) | kiwoom(ust21630 실제 값)
+# sell_price_source: estimate(주문 시점 기록: 장마감 청산은 주문가, 손절·익절은 현재가) | kiwoom(ust21630 실제 체결매도가)
 TRADE_FIELDS = [
     "timestamp", "date", "ticker", "buy_price", "sell_price", "qty",
     "profit_usd", "profit_pct", "exit_reason",
     "fee_usd", "net_profit_usd", "net_profit_pct", "fee_source",
+    "sell_price_source",
 ]
 
 
@@ -71,7 +73,7 @@ def _migrate_trade_csv() -> None:
             except (KeyError, TypeError, ValueError):
                 pass
     _write_trade_rows(rows)
-    print(f"🧾 [매매 기록] trade_history.csv에 수수료 컬럼을 추가했습니다 ({len(rows)}행)")
+    print(f"🧾 [매매 기록] trade_history.csv에 새 컬럼(수수료·매도가 출처)을 추가했습니다 ({len(rows)}행)")
 
 
 def load_trades_for_date(date_str: str) -> List[Dict[str, Any]]:
@@ -90,22 +92,47 @@ def load_trades_for_date(date_str: str) -> List[Dict[str, Any]]:
     return trades
 
 
-def apply_kiwoom_realized(date_str: str, realized_rows: List[Dict[str, Any]]) -> int:
-    """키움 당일 실현손익(ust21630)의 종목별 수수료·제세금으로 추정 수수료를 덮어쓴다.
+def _num(value) -> float:
+    return float(str(value if value is not None else "0").replace(",", "").replace("+", "").strip() or "0")
 
-    ust21630은 종목별 합계라, 같은 종목을 하루에 여러 번 팔았으면 매수금액 비율로 나눈다.
+
+def _apply_sell_price(row: Dict[str, Any], sell_price: float) -> None:
+    """매도가를 실제 체결가로 바꾸고 가격 기준 손익을 다시 계산한다 (수수료·순손익은 호출한 쪽에서 다시 계산)"""
+    buy_price = float(row["buy_price"])
+    qty = int(float(row["qty"]))
+    row["sell_price"] = round(sell_price, 4)
+    row["profit_usd"] = round((sell_price - buy_price) * qty, 4)
+    row["profit_pct"] = round((sell_price - buy_price) / buy_price * 100, 2) if buy_price > 0 else 0.0
+    row["sell_price_source"] = "kiwoom"
+
+
+def apply_kiwoom_realized(date_str: str, realized_rows: List[Dict[str, Any]]) -> int:
+    """키움 당일 실현손익(ust21630)으로 매도가와 수수료를 실제 값으로 덮어쓴다.
+
+    - 매도가: 기록은 주문을 낼 때의 가격이라 실제 체결가(cntr_sella)와 다를 수 있다.
+      종목별 체결매도수량(cntr_sellq)이 그날 기록 수량 합과 같을 때만 바꾼다 (날짜 기준이 어긋나면 그대로 둠).
+      ust21630은 종목별 합계라 같은 종목을 여러 번 팔았으면 모두 평균 체결가가 된다.
+    - 수수료·제세금(cmsn+altx): 같은 종목을 여러 번 팔았으면 매수금액 비율로 나눈다.
     """
     fees_by_ticker = {}
+    fills_by_ticker = {}
     for r in realized_rows or []:
         ticker = str(r.get("stk_cd", "")).strip().upper()
+        if not ticker:
+            continue
         try:
-            fee = abs(float(str(r.get("cmsn") or 0).replace(",", ""))) + abs(
-                float(str(r.get("altx") or 0).replace(",", ""))
-            )
+            fee = abs(_num(r.get("cmsn"))) + abs(_num(r.get("altx")))
         except ValueError:
             continue
-        if ticker:
-            fees_by_ticker[ticker] = fees_by_ticker.get(ticker, 0.0) + fee
+        fees_by_ticker[ticker] = fees_by_ticker.get(ticker, 0.0) + fee
+        try:
+            sell_qty = int(abs(_num(r.get("cntr_sellq"))))
+            sell_price = abs(_num(r.get("cntr_sella")))
+        except ValueError:
+            continue
+        if sell_qty > 0 and sell_price > 0:
+            prev_qty, prev_amt = fills_by_ticker.get(ticker, (0, 0.0))
+            fills_by_ticker[ticker] = (prev_qty + sell_qty, prev_amt + sell_price * sell_qty)
     if not fees_by_ticker:
         return 0
 
@@ -117,6 +144,21 @@ def apply_kiwoom_realized(date_str: str, realized_rows: List[Dict[str, Any]]) ->
             r for r in rows
             if r.get("date") == date_str and str(r.get("ticker", "")).upper() == ticker
         ]
+        if not targets:
+            continue
+        fill = fills_by_ticker.get(ticker)
+        logged_qty = sum(int(float(r["qty"])) for r in targets)
+        if fill and fill[0] == logged_qty:
+            avg_sell = fill[1] / fill[0]
+            for row in targets:
+                before = float(row["sell_price"])
+                _apply_sell_price(row, avg_sell)
+                print(f"🧾 [체결가 확인] {ticker}: 기록 ${before:.4f} → 키움 체결 ${avg_sell:.4f}")
+        elif fill:
+            print(
+                f"⚠️ [체결가 미반영] {ticker}: 키움 체결매도 {fill[0]}주 ≠ 기록 {logged_qty}주 "
+                "(주문 시점 가격 유지)"
+            )
         weights = [float(r["buy_price"]) * float(r["qty"]) for r in targets]
         total_weight = sum(weights)
         for row, weight in zip(targets, weights):
@@ -187,6 +229,7 @@ def record_trade(
         "profit_usd": round(profit_amt, 4),
         "profit_pct": round(profit_pct, 2),
         "exit_reason": exit_reason,
+        "sell_price_source": "estimate",
     }
     _with_net(row, estimate_fee_usd(buy_price, sell_price, qty), "estimate")
 
