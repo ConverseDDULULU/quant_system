@@ -106,6 +106,18 @@ gcloud compute ssh <VM이름> --zone asia-northeast3-a -- -L 8000:localhost:8000
 | 누적 성적 | `cd quant_system && PYTHONPATH=src:. .venv/bin/python src/soxl_paper.py --report` |
 | 끄기 | `sudo systemctl disable --now quant-soxl-paper` |
 
+### SOXL·SOXS 단타 실거래 (실주문, 2026-11-11 켬)
+
+`src/soxl_live.py`. 매매 엔진(`quant-scheduler`) 안에서 돌고, 서버 `config/.env`의 `SOXL_LIVE=on`일 때만 동작해요. 조건(사용자 결정)은 1주, 손절 수익률 -2.5%, 익절 +5%, 마감 10분 전 정리, 종목별 하루 1번이에요. 서킷브레이커는 그대로 적용돼요.
+
+| 하고 싶은 것 | 명령 (서버) |
+|---|---|
+| 켜졌는지 확인 | `cd quant_system && grep -c '^SOXL_LIVE=on' config/.env` (1이면 켜짐) |
+| 끄기 | `cd quant_system && sed -i 's/^SOXL_LIVE=.*/SOXL_LIVE=off/' config/.env && sudo systemctl restart quant-scheduler` |
+| 오늘 로그 | `journalctl -u quant-scheduler --since today -o cat \| grep -E 'SOXL 단타\|분기: soxl'` |
+
+> 끄기는 SOXL·SOXS를 들고 있지 않을 때나 장외 시간에 해요. 들고 있는데 끄면 다음 점검부터 일반 기준(-1.8%)이 적용돼 바로 손절될 수 있어요.
+
 ## 8. 노트북(두 번째 PC)에서 작업하기
 
 실제 매매는 서버에서 돌아요. PC에 묶여 있는 건 Claude 작업 환경(코드, gcloud 로그인 등)뿐이라, 노트북에도 같은 환경을 만들면 PC 없이 관리할 수 있어요.
