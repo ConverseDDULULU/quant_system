@@ -624,6 +624,7 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
         branch = analysis.get("entry_branch") or "-"
         relaxed = analysis.get("relaxed_passed")
         relaxed_txt = f" | 완화 {relaxed}/4" if relaxed is not None else ""
+        gain_txt = _day_gain_text(candidate, price)
 
         print(
             f"📊 [{ticker:4s}] 현재가: ${price:6.2f} | 거래량: {vol_surge:4.1f}배 | 이격도: {disparity:5.1f}% | RSI: {rsi_val:4.1f} | Stoch: {k_val:.1f}/{d_val:.1f} | OBV: {obv_txt} | 판정: {sig} | 분기: {branch}{relaxed_txt}"
@@ -690,7 +691,7 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
                 return_code = res.get("return_code", -1)
                 return_msg = res.get("return_msg", "응답 없음")
                 print(
-                    f"  ➔ 키움 실계좌 매수 접수 응답 ({exchange_code}): [{return_code}] {return_msg} | 분기: {branch}"
+                    f"  ➔ 키움 실계좌 매수 접수 응답 ({exchange_code}): [{return_code}] {return_msg} | 분기: {branch} | {gain_txt}"
                 )
                 if str(return_code) == "0":
                     finish_ticker_buy(ticker, accepted=True)
@@ -701,11 +702,29 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
                         f"✅ **[매수 주문 접수 성공]** {ticker} {buy_qty}주\n"
                         f"- 주문단가: ${numeric_price:.2f}\n"
                         f"- 진입 분기: {branch_label} ({branch})\n"
+                        f"- {gain_txt}\n"
                         f"- 진입 지표: RSI {rsi_val:.1f} | 거래량 {vol_surge:.1f}배 | 20이평 밀착 ({disparity:.1f}%) | Stoch({k_val:.1f}>{d_val:.1f}) | OBV {obv_txt}"
                     )
                 else:
                     finish_ticker_buy(ticker, accepted=False)
                 time.sleep(2)
+
+
+def _day_gain_text(candidate: dict, signal_price: float) -> str:
+    """매수 로그용 당일 상승률: 순위 조회 시점 값(후보 필터 기준)과 신호 시점 현재가로 환산한 값"""
+    try:
+        rank_pct = float(candidate.get("change_pct"))
+    except (TypeError, ValueError):
+        return "당일 상승률: 알 수 없음"
+    text = f"당일 상승률 {rank_pct:+.2f}% (순위 조회 시점)"
+    try:
+        rank_price = float(candidate.get("price") or 0)
+        if rank_price > 0 and signal_price > 0 and rank_pct > -100:
+            prev_close = rank_price / (1 + rank_pct / 100)
+            text += f" / 신호 시점 약 {(signal_price / prev_close - 1) * 100:+.2f}%"
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+    return text
 
 
 def minutes_since_open() -> float | None:
