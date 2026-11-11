@@ -379,16 +379,22 @@ def run_daily_review(day, discord_sender=None) -> str:
     today_trades = trades[trades["date"] == day] if not trades.empty else trades
     today_stats = trade_stats(today_trades)
     window_stats = trade_stats(trades)
-    follow = exit_followthrough(trades) if not trades.empty else {}
+    # SOXL·SOXS 단타(청산 이유 "...(soxl)")는 자체 고정 기준이라 일반 매매 조건 자동 조정 근거에서 뺀다
+    soxl_mask = trades["exit_reason"].astype(str).str.contains("(soxl)", regex=False) if not trades.empty else None
+    tune_trades = trades[~soxl_mask] if soxl_mask is not None else trades
+    tune_stats = trade_stats(tune_trades)
+    follow = exit_followthrough(tune_trades) if not tune_trades.empty else {}
     holds = overnight_hold_outcomes(load_trades(window_days[0] - timedelta(days=7), day))
 
     params = strategy_params.load_params()
     diff, reasons = {}, ["AUTO_TUNE_MODE=off: 조정 계산 안 함"]
     if mode != "off":
-        if window_stats["count"]:
-            proposed, reasons = propose_changes(window_stats, follow, holds, params)
+        if tune_stats["count"]:
+            proposed, reasons = propose_changes(tune_stats, follow, holds, params)
         else:
             proposed, reasons = {}, ["최근 매매 기록 없음: 조정 보류"]
+        if soxl_mask is not None and soxl_mask.any():
+            reasons = reasons + [f"SOXL 단타 {int(soxl_mask.sum())}건은 조정 근거에서 제외"]
         if mode == "apply" and proposed:
             diff = strategy_params.update_params(proposed, reason=" / ".join(reasons))
             params = strategy_params.load_params()

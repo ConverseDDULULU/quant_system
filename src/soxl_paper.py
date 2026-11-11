@@ -96,35 +96,47 @@ def signal_direction(base: pd.DataFrame, i: int) -> int:
 
 # ---------- 상태 ----------
 
+MAIN_RULE = {"stop": STOP_LOSS_PCT, "tp": TAKE_PROFIT_PCT, "one_per_ticker": False}
+# 실거래(soxl_live) 조건 비교용: 수익률(수수료 포함) -2.5% 손절 ≈ 가격 -2.0%, +5% 익절 ≈ 가격 +5.5%,
+# 종목별 하루 1번(실거래는 당일 재진입 차단을 따름). 디스코드 개별 알림 없이 기록·요약만 한다
+LIVE_RULE = {"stop": 2.0, "tp": 5.5, "one_per_ticker": True}
+
+
+def live_rule_paths() -> tuple[str, str]:
+    return os.path.join(DATA_DIR, "state_live_rule.json"), os.path.join(DATA_DIR, "trades_live_rule.jsonl")
+
+
 def new_state() -> dict:
-    return {"last_bar": None, "day": None, "entries_today": 0, "position": None, "pending": None, "summary_sent": None}
+    return {"last_bar": None, "day": None, "entries_today": 0, "tickers_today": [], "position": None, "pending": None, "summary_sent": None}
 
 
-def load_state() -> dict:
+def load_state(path: str | None = None) -> dict:
     try:
-        with open(STATE_PATH, encoding="utf-8") as f:
+        with open(path or STATE_PATH, encoding="utf-8") as f:
             return {**new_state(), **json.load(f)}
     except (FileNotFoundError, json.JSONDecodeError):
         return new_state()
 
 
-def save_state(state: dict) -> None:
-    os.makedirs(DATA_DIR, exist_ok=True)
-    tmp = STATE_PATH + ".tmp"
+def save_state(state: dict, path: str | None = None) -> None:
+    path = path or STATE_PATH
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, STATE_PATH)
+    os.replace(tmp, path)
 
 
-def append_trade(trade: dict) -> None:
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(TRADES_PATH, "a", encoding="utf-8") as f:
+def append_trade(trade: dict, path: str | None = None) -> None:
+    path = path or TRADES_PATH
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(trade, ensure_ascii=False) + "\n")
 
 
-def read_trades() -> list[dict]:
+def read_trades(path: str | None = None) -> list[dict]:
     try:
-        with open(TRADES_PATH, encoding="utf-8") as f:
+        with open(path or TRADES_PATH, encoding="utf-8") as f:
             return [json.loads(line) for line in f if line.strip()]
     except FileNotFoundError:
         return []
@@ -132,8 +144,10 @@ def read_trades() -> list[dict]:
 
 # ---------- 한 봉씩 처리 (과거 시험과 같은 순서) ----------
 
-def process_bars(state: dict, base: pd.DataFrame, etfs: dict[str, pd.DataFrame], start: int, on_event) -> None:
+def process_bars(state: dict, base: pd.DataFrame, etfs: dict[str, pd.DataFrame], start: int, on_event, rule: dict | None = None) -> None:
     """base·etfs는 같은 시각 인덱스. start부터 끝까지 완성된 봉을 순서대로 처리한다"""
+    rule = rule or MAIN_RULE
+    state.setdefault("tickers_today", [])
     for i in range(max(start, 1), len(base)):
         ts = base.index[i]
         day = ts.date()
@@ -146,7 +160,7 @@ def process_bars(state: dict, base: pd.DataFrame, etfs: dict[str, pd.DataFrame],
                 pos_t = state["position"]["ticker"]
                 prev_ts = base.index[i - 1]
                 _close_position(state, float(etfs[pos_t].iloc[i - 1]["Close"]), "마감(봉 누락)", prev_ts, on_event)
-            state.update(day=day.isoformat(), entries_today=0, pending=None)
+            state.update(day=day.isoformat(), entries_today=0, tickers_today=[], pending=None)
         state["last_bar"] = ts.isoformat()
 
         if state["pending"]:
@@ -160,8 +174,8 @@ def process_bars(state: dict, base: pd.DataFrame, etfs: dict[str, pd.DataFrame],
         if pos:
             row = etfs[pos["ticker"]].iloc[i]
             entry = pos["entry"]
-            stop_px = entry * (1 - STOP_LOSS_PCT / 100)
-            tp_px = entry * (1 + TAKE_PROFIT_PCT / 100)
+            stop_px = entry * (1 - rule["stop"] / 100)
+            tp_px = entry * (1 + rule["tp"] / 100)
             if ts >= close_dt - timedelta(minutes=EXIT_BEFORE_CLOSE_MIN):
                 _close_position(state, float(row["Open"]), "마감 정리", ts, on_event)
             elif row["Low"] <= stop_px:
@@ -174,9 +188,11 @@ def process_bars(state: dict, base: pd.DataFrame, etfs: dict[str, pd.DataFrame],
         entry_end = close_dt - timedelta(minutes=ENTRY_END_MIN)
         if entry_start <= ts <= entry_end and state["entries_today"] < MAX_ENTRIES_PER_DAY:
             direction = signal_direction(base, i)
-            if direction:
-                state["pending"] = LONG if direction > 0 else INVERSE
+            ticker = LONG if direction > 0 else INVERSE
+            if direction and not (rule["one_per_ticker"] and ticker in state["tickers_today"]):
+                state["pending"] = ticker
                 state["entries_today"] += 1
+                state["tickers_today"].append(ticker)
 
 
 def _close_position(state: dict, exit_px: float, reason: str, ts, on_event) -> None:
@@ -248,18 +264,20 @@ def send_discord(content: str) -> None:
         print(f"⚠️ [SOXL 모의] 디스코드 전송 실패: {type(e).__name__}")
 
 
-def make_event_handler(notify, catch_up: bool):
+def make_event_handler(notify, catch_up: bool, trades_path: str | None = None, quiet: bool = False):
     tag = " (재시작 뒤 따라잡기)" if catch_up else ""
 
     def on_event(kind: str, info: dict) -> None:
         if kind == "entry":
             msg = f"🧪 [모의] {info['ticker']} 매수 @ ${info['entry']:.2f} ({info['at'][11:16]} 뉴욕){tag}"
         else:
-            append_trade(info)
+            append_trade(info, trades_path)
             msg = (
                 f"🧪 [모의] {info['ticker']} {info['reason']} @ ${info['exit']:.2f} | 순손익 {info['net_pct']:+.2f}% "
                 f"({info['paper_qty']}주면 ${info['paper_usd']:+.2f}){tag}"
             )
+        if quiet:
+            return
         print(msg)
         if notify:
             notify(msg)
@@ -267,15 +285,8 @@ def make_event_handler(notify, catch_up: bool):
     return on_event
 
 
-def run_once(now: datetime | None = None, notify=send_discord) -> None:
-    now = now or now_ny()
-    state = load_state()
-    fetched = fetch_frames(now)
-    if fetched is None:
-        return
-    base, etfs = fetched
-    if base.empty:
-        return
+def _run_track(base, etfs, now, state_path, trades_path, rule, notify, quiet) -> None:
+    state = load_state(state_path)
     today = now.date().isoformat()
     last = pd.Timestamp(state["last_bar"]) if state["last_bar"] else None
     if last is not None and last >= base.index[0]:
@@ -293,8 +304,30 @@ def run_once(now: datetime | None = None, notify=send_discord) -> None:
             return
         start = int(todays[0])
     catch_up = start < len(base) - 1
-    process_bars(state, base, etfs, start, make_event_handler(notify, catch_up))
-    save_state(state)
+    process_bars(state, base, etfs, start, make_event_handler(notify, catch_up, trades_path, quiet), rule)
+    save_state(state, state_path)
+
+
+def run_once(now: datetime | None = None, notify=send_discord) -> None:
+    now = now or now_ny()
+    fetched = fetch_frames(now)
+    if fetched is None:
+        return
+    base, etfs = fetched
+    if base.empty:
+        return
+    _run_track(base, etfs, now, STATE_PATH, TRADES_PATH, MAIN_RULE, notify, quiet=False)
+    live_state, live_trades = live_rule_paths()
+    _run_track(base, etfs, now, live_state, live_trades, LIVE_RULE, None, quiet=True)
+
+
+def _stats_line(trades: list[dict]) -> str:
+    nets = [t["net_pct"] for t in trades]
+    wins = sum(1 for n in nets if n > 0)
+    return (
+        f"누적 {len(trades)}건 | 이긴 비율 {wins / len(trades) * 100:.0f}% | 건당 평균 {np.mean(nets):+.2f}% | "
+        f"합계 {sum(nets):+.2f}%"
+    )
 
 
 def daily_summary(day: str) -> str:
@@ -307,11 +340,14 @@ def daily_summary(day: str) -> str:
     else:
         lines.append("• 오늘 신호 없음")
     if trades:
-        nets = [t["net_pct"] for t in trades]
-        wins = sum(1 for n in nets if n > 0)
         lines.append(
-            f"누적 {len(trades)}건 | 이긴 비율 {wins / len(trades) * 100:.0f}% | 건당 평균 {np.mean(nets):+.2f}% | "
-            f"합계 {sum(nets):+.2f}% | 종목당 ${PAPER_CAPITAL_USD / 2:.0f} 기준 ${sum(t['paper_usd'] for t in trades):+.2f}"
+            f"[모의 손절 -4%] {_stats_line(trades)} | 종목당 ${PAPER_CAPITAL_USD / 2:.0f} 기준 ${sum(t['paper_usd'] for t in trades):+.2f}"
+        )
+    live_trades = read_trades(live_rule_paths()[1])
+    if live_trades:
+        today_live = [f"{t['ticker']} {t['reason']} {t['net_pct']:+.2f}%" for t in live_trades if t["day"] == day]
+        lines.append(
+            f"[실거래 조건 손절 수익률 -2.5%·종목별 하루 1번] 오늘 {', '.join(today_live) or '없음'} | {_stats_line(live_trades)}"
         )
     return "\n".join(lines)
 

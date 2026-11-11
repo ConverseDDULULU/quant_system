@@ -12,6 +12,7 @@ import pytz
 import bear_mode
 import pending_orders
 import sector_guard
+import soxl_live
 import daily_review
 import strategy_params
 import trading_safety
@@ -452,27 +453,33 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
             sell_reason = ""
 
             position_key = f"scheduler:{ticker}:{buy_price:.4f}:{qty}"
-            take_profit_armed = (
-                not dry_run and is_take_profit_armed(position_key)
-            )
-            if profit_rate >= trading_safety.TAKE_PROFIT_PCT:
-                take_profit_armed = True
-                if not dry_run:
-                    arm_take_profit(position_key)
-
-            momentum_continues = False
-            if take_profit_armed and profit_rate < trading_safety.MAX_TAKE_PROFIT_PCT:
-                exchange_code = get_exchange_code(client, ticker)
-                analysis = get_bottom_reversal_signal(client, ticker, exchange_code)
-                momentum_continues = bool(
-                    analysis and analysis.get("momentum_continues", False)
+            is_soxl = soxl_live.manages(ticker)
+            stop_basis = soxl_live.STOP_LOSS_PCT if is_soxl else trading_safety.STOP_LOSS_PCT
+            if is_soxl:
+                # SOXL·SOXS 단타: 수익률 -2.5% 손절, +5% 바로 익절 (익절 대기·모멘텀 판단 없음)
+                exit_rule = soxl_live.exit_rule(profit_rate)
+            else:
+                take_profit_armed = (
+                    not dry_run and is_take_profit_armed(position_key)
                 )
+                if profit_rate >= trading_safety.TAKE_PROFIT_PCT:
+                    take_profit_armed = True
+                    if not dry_run:
+                        arm_take_profit(position_key)
 
-            exit_rule = get_exit_rule(
-                profit_rate,
-                momentum_continues=momentum_continues,
-                take_profit_armed=take_profit_armed,
-            )
+                momentum_continues = False
+                if take_profit_armed and profit_rate < trading_safety.MAX_TAKE_PROFIT_PCT:
+                    exchange_code = get_exchange_code(client, ticker)
+                    analysis = get_bottom_reversal_signal(client, ticker, exchange_code)
+                    momentum_continues = bool(
+                        analysis and analysis.get("momentum_continues", False)
+                    )
+
+                exit_rule = get_exit_rule(
+                    profit_rate,
+                    momentum_continues=momentum_continues,
+                    take_profit_armed=take_profit_armed,
+                )
             if exit_rule == "MAX_TAKE_PROFIT":
                 is_sell_triggered = True
                 sell_reason = f"🚀 **[최대 상한 익절]** {ticker} {qty}주 (+{profit_rate:.2f}%, 단가: ${now_price:.2f})"
@@ -484,6 +491,8 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
                 sell_reason = f"🚨 **[손절]** {ticker} {qty}주 ({profit_rate:.2f}%, 단가: ${now_price:.2f})"
 
             if is_sell_triggered:
+                if is_soxl:
+                    sell_reason += f" | 분기: {soxl_live.BRANCH}"
                 print(f"   ➔ {sell_reason}")
 
                 if not dry_run:
@@ -496,19 +505,20 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
                     if str(return_code) == "0":
                         clear_position_exit_state(position_key)
                         record_ticker_sell(ticker)
+                        exit_name = {"STOP_LOSS": "손절", "TAKE_PROFIT": "익절", "MAX_TAKE_PROFIT": "최대익절"}[exit_rule]
                         _log_completed_trade(
                             ticker,
                             buy_price,
                             now_price,
                             qty,
-                            {"STOP_LOSS": "손절", "TAKE_PROFIT": "익절", "MAX_TAKE_PROFIT": "최대익절"}[exit_rule],
+                            soxl_live.label(exit_name) if is_soxl else exit_name,
                             net_profit_pct=profit_rate,
                         )
                         if exit_rule == "STOP_LOSS":
                             # 점검 간격별 비교용: 손절 기준을 얼마나 넘어서 팔았는지
                             print(
-                                f"   📐 [손절 초과폭] {ticker} 수익률 {profit_rate:+.2f}% / 기준 {trading_safety.STOP_LOSS_PCT:+.2f}% / "
-                                f"초과 {trading_safety.STOP_LOSS_PCT - profit_rate:.2f}%p / 점검 {HOLDING_CHECK_SECONDS}초"
+                                f"   📐 [손절 초과폭] {ticker} 수익률 {profit_rate:+.2f}% / 기준 {stop_basis:+.2f}% / "
+                                f"초과 {stop_basis - profit_rate:.2f}%p / 점검 {HOLDING_CHECK_SECONDS}초"
                             )
                             breaker = record_stop_loss(
                                 position_key=f"scheduler:{ticker}:{buy_price:.4f}:{qty}",
@@ -567,6 +577,12 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
 
     MAX_HOLDINGS = PARAMS["max_holdings"]
 
+    # SOXL·SOXS 단타 (SOXL_LIVE=on일 때만). 하락장·장세 필터보다 먼저 본다 (SOXS가 하락 쪽 진입)
+    soxl_bought = _try_soxl_entry(client, held_tickers, usd_available, MAX_HOLDINGS, dry_run)
+    if soxl_bought:
+        held_tickers.append(soxl_bought[0])
+        usd_available -= soxl_bought[1]
+
     # 하락장 대응: 하락 추세 + 악재 확인 시 일반 매수 대신 1배 인버스 ETF 진입 (bear_mode.py)
     if bear_mode.is_enabled():
         is_bear, bear_reason = bear_mode.detect_bear_market(client)
@@ -605,6 +621,8 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
         exchange_code = candidate["exchange"]
         if ticker in held_tickers:
             continue
+        if soxl_live.manages(ticker):
+            continue  # SOXL·SOXS는 단타 전용 규칙(_try_soxl_entry)으로만 산다
         if has_ticker_activity_today(ticker):
             print(f"⏸️ [당일 재진입 차단] {ticker}: 오늘 이미 주문했습니다.")
             continue
@@ -736,6 +754,74 @@ def minutes_since_open() -> float | None:
     return (now - bounds[0]).total_seconds() / 60
 
 
+def _try_soxl_entry(client, held_tickers, usd_available, max_holdings, dry_run) -> tuple[str, float] | None:
+    """SOXL·SOXS 단타 진입 (soxl_live). 주문이 접수되면 (종목, 주문 금액), 아니면 None
+
+    어떤 오류가 나도 예외를 밖으로 내지 않는다 (일반 매수 탐색은 계속).
+    """
+    if not soxl_live.is_enabled():
+        return None
+    try:
+        if any(t in held_tickers for t in soxl_live.TICKERS):
+            return None  # 한 번에 하나만 (대기 매수 포함)
+        done_today = [t for t in soxl_live.TICKERS if has_ticker_activity_today(t)]
+        if len(done_today) >= soxl_live.MAX_ENTRIES_PER_DAY:
+            return None
+        signal = soxl_live.check_signal()
+        if not signal:
+            return None
+        ticker = signal["ticker"]
+        print(f"📈 [SOXL 단타 신호] {ticker}: {signal['reason']} | 분기: {soxl_live.BRANCH}")
+        if len(held_tickers) >= max_holdings:
+            print(f"   ⏸️ [SOXL 단타] 보유 칸 만석 ({len(held_tickers)}/{max_holdings}), 진입 안 함")
+            return None
+        if ticker in done_today:
+            print(f"   ⏸️ [SOXL 단타] 오늘 이미 {ticker}를 주문해 다시 사지 않음 (종목별 하루 1번)")
+            return None
+        price = soxl_live.quote_price(client, ticker)
+        if price <= 0:
+            print(f"   ⚠️ [SOXL 단타] {ticker} 현재가를 확인하지 못해 진입 안 함")
+            return None
+        limit_price = format_us_price(price * soxl_live.BUY_LIMIT_PREMIUM)
+        cost = limit_price * soxl_live.QTY
+        budget = position_budget_usd(INITIAL_BALANCE or usd_available, usd_available)
+        if cost > budget:
+            print(f"   ⏸️ [SOXL 단타] {ticker} {soxl_live.QTY}주 ${cost:.2f} > 한 종목 예산 ${budget:.2f}, 진입 안 함")
+            return None
+        if cost > usd_available:
+            print(f"   ⏸️ [SOXL 단타] 주문가능 외화 ${usd_available:.2f} < ${cost:.2f}, 진입 안 함")
+            return None
+        if dry_run:
+            print(f"   🧪 [SOXL 단타] (가상) {ticker} {soxl_live.QTY}주 @ ${limit_price:.2f}")
+            return None
+        if not reserve_ticker_buy(ticker):
+            print(f"   ⏸️ [당일 재진입 차단] {ticker}: 이미 주문했습니다.")
+            return None
+        res = client.order_us_stock(
+            ticker=ticker, order_type="BUY", qty=soxl_live.QTY, price=limit_price, exchange=soxl_live.EXCHANGE
+        ) or {}
+        return_code = res.get("return_code", -1)
+        print(
+            f"  ➔ 키움 실계좌 매수 접수 응답 ({soxl_live.EXCHANGE}): [{return_code}] {res.get('return_msg', '응답 없음')} "
+            f"| 분기: {soxl_live.BRANCH}"
+        )
+        if str(return_code) != "0":
+            finish_ticker_buy(ticker, accepted=False)
+            return None
+        finish_ticker_buy(ticker, accepted=True)
+        TODAY_BOUGHT.append(ticker)
+        send_discord_message(
+            f"📈 **[SOXL 단타 매수 접수]** {ticker} {soxl_live.QTY}주 @ ${limit_price:.2f}\n"
+            f"- 진입 분기: SOXL·SOXS 단타 ({soxl_live.BRANCH})\n"
+            f"- 신호: {signal['reason']}\n"
+            f"- 손절 수익률 {soxl_live.STOP_LOSS_PCT}% / 익절 +{soxl_live.TAKE_PROFIT_PCT}% / 마감 10분 전 정리"
+        )
+        return ticker, cost
+    except Exception as e:
+        print(f"⚠️ [SOXL 단타] 진입 처리 오류: {type(e).__name__}: {e} (일반 매수는 계속)")
+        return None
+
+
 def try_inverse_entry(client, held_tickers, usd_available, max_holdings, bear_reason, dry_run):
     """하락장에서 1배 인버스 ETF를 한 종목만 매수 (악재 확인·상승 탄력·종목당 예산 적용)"""
     inverse_tickers = {t for t, _ in bear_mode.INVERSE_ETFS}
@@ -823,7 +909,7 @@ def liquidate_all_positions(client, held_positions: list, pending_sells: set = f
             profit_rate = float(str(item.get("pl_rt", "0")).replace(",", "").strip() or "0")
         except (TypeError, ValueError):
             profit_rate = 0.0
-        if ticker:
+        if ticker and not soxl_live.manages(ticker):  # SOXL·SOXS 단타는 오버나잇 홀딩 없이 정리
             positions.append({"ticker": ticker, "profit_rate": profit_rate})
 
     try:
@@ -903,7 +989,8 @@ def liquidate_all_positions(client, held_positions: list, pending_sells: set = f
             except (TypeError, ValueError):
                 net_pct = None
             # 현재가가 아니라 실제로 낸 주문가로 기록 (실제 체결가는 장마감 결산 때 키움 실현손익 ust21630으로 덮어씀)
-            _log_completed_trade(ticker, buy_price, float(sell_target_price), qty, "장마감청산", net_profit_pct=net_pct)
+            close_reason = soxl_live.label("장마감청산") if soxl_live.manages(ticker) else "장마감청산"
+            _log_completed_trade(ticker, buy_price, float(sell_target_price), qty, close_reason, net_profit_pct=net_pct)
         else:
             skipped_orders += 1
         time.sleep(1)
