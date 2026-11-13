@@ -511,12 +511,74 @@ class KiwoomClient:
             )
             data = response.json()
         except Exception as exc:
-            print(f"⚠️ {ticker} 키움 시세 조회 실패: {exc}")
+            print(f"⚠️ {ticker} 키움 시세 조회 실패({exchange.upper()}): {exc}")
             return {}
 
         if str(data.get("return_code", "0")) != "0":
+            print(
+                f"⚠️ {ticker} 키움 시세 조회 거절({exchange.upper()}): "
+                f"HTTP {getattr(response, 'status_code', '?')} "
+                f"[{data.get('return_code')}] {data.get('return_msg', '응답 없음')}"
+            )
+            self._log_exchange_hint(ticker, exchange)
             return {}
+        if not str(data.get("cur_prc", "")).strip():
+            print(
+                f"⚠️ {ticker} 키움 시세 응답에 현재가 없음({exchange.upper()}): "
+                f"[{data.get('return_code')}] {data.get('return_msg', '응답 없음')}"
+            )
+            self._log_exchange_hint(ticker, exchange)
         return data
+
+    def get_us_exchange_info(self, ticker: str) -> str:
+        """키움이 알려 주는 종목의 거래소 코드(usa10098 stex_tp: NA/ND/NY). 실패하면 빈 문자열"""
+        self._ensure_token()
+        headers = {
+            "Content-Type": "application/json;charset=UTF-8",
+            "authorization": f"Bearer {self.access_token}",
+            "api-id": "usa10098",
+        }
+        try:
+            response = self._post(
+                f"{self.base_url}/api/us/stkinfo",
+                headers=headers,
+                json={"stk_cd": ticker.upper().strip()},
+                timeout=10,
+            )
+            data = response.json()
+        except Exception as exc:
+            print(f"⚠️ {ticker} 키움 거래소구분 조회 실패: {exc}")
+            return ""
+        if str(data.get("return_code", "0")) != "0":
+            print(
+                f"⚠️ {ticker} 키움 거래소구분 조회 거절: "
+                f"[{data.get('return_code')}] {data.get('return_msg', '응답 없음')}"
+            )
+            return ""
+        rows = data.get("list") or []
+        if isinstance(rows, dict):
+            rows = [rows]
+        for row in rows:
+            if isinstance(row, dict) and str(row.get("stk_cd", "")).upper().strip() == ticker.upper().strip():
+                return str(row.get("stex_tp", "")).upper().strip()
+        return ""
+
+    def _log_exchange_hint(self, ticker: str, exchange: str) -> None:
+        """시세 조회가 실패하면 키움이 아는 거래소 코드를 한 번만(종목별) 찾아 로그로 남긴다. 진단용"""
+        checked = getattr(self, "_exchange_hint_checked", None)
+        if checked is None:
+            checked = self._exchange_hint_checked = set()
+        key = ticker.upper().strip()
+        if key in checked:
+            return
+        checked.add(key)
+        actual = self.get_us_exchange_info(key)
+        if not actual:
+            return
+        if actual != exchange.upper():
+            print(f"📌 [거래소 코드 확인] {key}: 요청 {exchange.upper()} → 키움 usa10098은 {actual}")
+        else:
+            print(f"📌 [거래소 코드 확인] {key}: 키움 usa10098도 {actual} (거래소 코드는 맞음)")
 
     def _get_us_rank_rows(
         self, api_id: str, body: dict, cache_key: tuple, max_pages: int, refresh: bool
