@@ -118,6 +118,13 @@ gcloud compute ssh <VM이름> --zone asia-northeast3-a -- -L 8000:localhost:8000
 
 > 끄기는 SOXL·SOXS를 들고 있지 않을 때나 장외 시간에 해요. 들고 있는데 끄면 다음 점검부터 일반 기준(-1.8%)이 적용돼 바로 손절될 수 있어요.
 
+**뉴스 1차 필터** (`src/soxl_news.py`, 2026-11-15 추가): 모의 서비스(`quant-soxl-paper`)가 장중 30분마다 반도체·시장 뉴스를 Gemini로 호재/중립/악재로 판정해 `data/soxl_paper/news_verdicts.jsonl`에 쌓아요. 엔진은 그 파일만 읽고, 악재면 SOXL, 호재면 SOXS 신호에서 진입하지 않아요. 판정이 없거나 45분보다 오래됐으면 기술 신호대로 해요. 스위치는 `.env`의 `SOXL_NEWS_FILTER`예요. 값은 `on`(기본, 줄이 없어도 on), `log`(기록만), `off`가 있고, 바꾸면 `quant-scheduler`를 재시작해요.
+
+| 하고 싶은 것 | 명령 (서버) |
+|---|---|
+| 오늘 뉴스 판정 | `cd quant_system && tail -5 data/soxl_paper/news_verdicts.jsonl` |
+| 차단된 신호 | `journalctl -u quant-scheduler --since today -o cat \| grep 'SOXL 뉴스 필터'` |
+
 ## 8. 노트북(두 번째 PC)에서 작업하기
 
 실제 매매는 서버에서 돌아요. PC에 묶여 있는 건 Claude 작업 환경(코드, gcloud 로그인 등)뿐이라, 노트북에도 같은 환경을 만들면 PC 없이 관리할 수 있어요.

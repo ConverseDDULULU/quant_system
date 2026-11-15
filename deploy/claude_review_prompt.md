@@ -32,6 +32,7 @@
   - 주문 로그: `📐 [손절 초과폭]`, `⏱️ [대기 주문 취소]`, `⏱️ [대기 주문 취소 확인]`, `✅ [대기 주문 체결 추정]`, `⏳ [대기 매수]`, `⏳ [매도 대기 중]`, `⚠️ [매도 대기 지연]`, `⚠️ [대기 매도 차단 해제]`, `⚠️ [매도 거절]`, `⚠️ [대기 주문 취소 실패]`, `⏸️ [대기 주문 확인 불가]`, `⏳ [개장 직후]`, `🧭 [업종 중복]`. 경고 줄이 있으면 보고에 적으세요.
   - 점검 간격 효과: 간격별(60초 → 30초 → 20초)로 손절 건수, 손절 후 당일 회복 비율, 손절 초과폭을 비교해 보고하세요. 키움 호출 한도 오류(1700, 429)가 늘었는지도 보세요. 거래가 적으면 판단을 보류하세요.
 - SOXL·SOXS 단타 실거래(`src/soxl_live.py`, 서버 `.env`의 `SOXL_LIVE=on`일 때만 동작): 사용자가 2026-11-11에 정한 고정 규칙이에요(1주, 손절 수익률 -2.5%, 익절 +5%, 마감 10분 전 정리, 종목별 하루 1번). 매매 기록의 청산 이유는 `손절(soxl)`·`익절(soxl)`·`장마감청산(soxl)`이고, 로그에는 `📈 [SOXL 단타 신호]`, `| 분기: soxl`이 남아요. 일반 매매와 나눠서 건수·이긴 비율·손익을 따로 보고하고, 같은 날 모의 기록(`data/soxl_paper/trades_live_rule.jsonl`은 실거래와 같은 조건, `data/soxl_paper/trades.jsonl`은 -4% 조건)과 비교하세요. SOXL 거래는 일반 매매 조건 조정 근거에 넣지 마세요.
+- SOXL·SOXS 뉴스 1차 필터(`src/soxl_news.py`, 사용자 요청 2026-11-15): 모의 서비스가 장중 30분마다 반도체·시장 헤드라인을 Gemini로 호재/중립/악재로 판정해 `data/soxl_paper/news_verdicts.jsonl`에 쌓아요. 악재면 SOXL, 호재면 SOXS 신호에서 진입하지 않아요. 로그에는 `📰 [SOXL 뉴스]`(판정)와 `📰 [SOXL 뉴스 필터] … 진입 안 함`(차단)이 남아요. 그날 판정 횟수와 판정별 개수, 판정 실패 횟수, 차단된 신호 수를 보고하세요. 모의 `data/soxl_paper/trades_live_news.jsonl`(실거래 조건 + 뉴스 필터)과 `trades_live_rule.jsonl`(필터 없음)도 비교하세요. 표본이 2026-11-26 무렵까지 쌓이기 전에는 필터가 좋다 나쁘다 결론 내지 말고 숫자만 적으세요.
 - 어떤 조건이 가장 자주 탈락시켰는지, 거의 통과할 뻔한 종목이 그 뒤 실제로 올랐는지 확인하세요.
 
 ## 3단계: 조정 (안전 규칙 필수)
@@ -44,7 +45,7 @@ B. **매수 조건 추가·삭제·완화**: `src/quant_scheduler.py`의 `get_bo
    5. `git push origin main`
    6. `bash deploy/update.sh`
    7. `systemctl is-active quant-scheduler quant-api`가 둘 다 active인지 확인
-C. **절대 하지 말 것**: 서킷브레이커(MAX_DAILY_STOP_COUNT, MAX_DAILY_LOSS_PCT)와 장세 필터를 없애거나 완화하기, 손절 없애기, `stale_sell_reprice_sec`를 0으로 끄기(안 팔린 손절 매도가 묶여요), dry_run 바꾸기, `config/.env` 수정(ENTRY_MODE, AUTO_TUNE_MODE, ENABLE_API_TRADING_ENGINE 포함), quant-api 매매 엔진 켜기, 1회 매수 수량·보유 종목 수 늘리기, `quant_scheduler.py`의 신호 함수 밖이나 다른 파일 고치기(`HOLDING_CHECK_SECONDS` 포함), `SOXL_LIVE` 켜고 끄기, `src/soxl_live.py`·`src/soxl_paper.py`의 손절·익절·수량·횟수 바꾸기, 정규장 중(뉴욕 09:30~16:00) 서비스 재시작. 공격 모드를 켤지 끌지는 사용자가 정해요. 의견만 적으세요.
+C. **절대 하지 말 것**: 서킷브레이커(MAX_DAILY_STOP_COUNT, MAX_DAILY_LOSS_PCT)와 장세 필터를 없애거나 완화하기, 손절 없애기, `stale_sell_reprice_sec`를 0으로 끄기(안 팔린 손절 매도가 묶여요), dry_run 바꾸기, `config/.env` 수정(ENTRY_MODE, AUTO_TUNE_MODE, ENABLE_API_TRADING_ENGINE 포함), quant-api 매매 엔진 켜기, 1회 매수 수량·보유 종목 수 늘리기, `quant_scheduler.py`의 신호 함수 밖이나 다른 파일 고치기(`HOLDING_CHECK_SECONDS` 포함), `SOXL_LIVE` 켜고 끄기, `src/soxl_live.py`·`src/soxl_paper.py`의 손절·익절·수량·횟수 바꾸기, `SOXL_NEWS_FILTER` 켜고 끄기와 `src/soxl_news.py`의 수치·질문·검색어 바꾸기, 정규장 중(뉴욕 09:30~16:00) 서비스 재시작. 공격 모드를 켤지 끌지는 사용자가 정해요. 의견만 적으세요.
 D. 누적 거래가 10건 미만이거나 근거가 약하면 억지로 바꾸지 말고 "보류"라고 적으세요. 바꾸지 않는 것도 정상적인 결과예요.
 E. 코드를 바꾼 뒤 push나 update.sh가 실패하면, 서버를 바꾸기 전 상태로 두고(`git reset --hard origin/main`) 디스코드에 실패를 알리세요.
 
