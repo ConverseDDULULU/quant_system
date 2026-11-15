@@ -34,6 +34,8 @@ import requests
 import yfinance as yf
 from dotenv import load_dotenv
 
+import soxl_news
+
 from market_calendar import NY_TZ, is_trading_day, now_ny, session_bounds
 
 warnings.filterwarnings("ignore", module="yfinance")  # 판다스 사용 중단 예고 경고가 1분마다 찍히는 것 방지
@@ -100,10 +102,17 @@ MAIN_RULE = {"stop": STOP_LOSS_PCT, "tp": TAKE_PROFIT_PCT, "one_per_ticker": Fal
 # 실거래(soxl_live) 조건 비교용: 수익률(수수료 포함) -2.5% 손절 ≈ 가격 -2.0%, +5% 익절 ≈ 가격 +5.5%,
 # 종목별 하루 1번(실거래는 당일 재진입 차단을 따름). 디스코드 개별 알림 없이 기록·요약만 한다
 LIVE_RULE = {"stop": 2.0, "tp": 5.5, "one_per_ticker": True}
+# 실거래 조건 + 뉴스 1차 필터(soxl_news): 악재면 SOXL, 호재면 SOXS 신호를 건너뛴다 (사용자 요청 2026-11-15)
+# 그 시점까지 쌓인 뉴스 판단만 쓰므로 재시작 뒤 따라잡을 때도 결과가 같다
+LIVE_NEWS_RULE = {**LIVE_RULE, "news_filter": True}
 
 
 def live_rule_paths() -> tuple[str, str]:
     return os.path.join(DATA_DIR, "state_live_rule.json"), os.path.join(DATA_DIR, "trades_live_rule.jsonl")
+
+
+def live_news_paths() -> tuple[str, str]:
+    return os.path.join(DATA_DIR, "state_live_news.json"), os.path.join(DATA_DIR, "trades_live_news.jsonl")
 
 
 def new_state() -> dict:
@@ -189,6 +198,9 @@ def process_bars(state: dict, base: pd.DataFrame, etfs: dict[str, pd.DataFrame],
         if entry_start <= ts <= entry_end and state["entries_today"] < MAX_ENTRIES_PER_DAY:
             direction = signal_direction(base, i)
             ticker = LONG if direction > 0 else INVERSE
+            if direction and rule.get("news_filter"):
+                if soxl_news.blocks(ticker, soxl_news.latest_at(ts + BAR + BAR_SETTLE, rule.get("news_path"))):
+                    continue  # 실거래처럼 막힌 신호는 진입 횟수·종목에 세지 않는다
             if direction and not (rule["one_per_ticker"] and ticker in state["tickers_today"]):
                 state["pending"] = ticker
                 state["entries_today"] += 1
@@ -319,6 +331,8 @@ def run_once(now: datetime | None = None, notify=send_discord) -> None:
     _run_track(base, etfs, now, STATE_PATH, TRADES_PATH, MAIN_RULE, notify, quiet=False)
     live_state, live_trades = live_rule_paths()
     _run_track(base, etfs, now, live_state, live_trades, LIVE_RULE, None, quiet=True)
+    news_state, news_trades = live_news_paths()
+    _run_track(base, etfs, now, news_state, news_trades, LIVE_NEWS_RULE, None, quiet=True)
 
 
 def _stats_line(trades: list[dict]) -> str:
@@ -349,7 +363,21 @@ def daily_summary(day: str) -> str:
         lines.append(
             f"[실거래 조건 손절 수익률 -2.5%·종목별 하루 1번] 오늘 {', '.join(today_live) or '없음'} | {_stats_line(live_trades)}"
         )
+    news_trades = read_trades(live_news_paths()[1])
+    if news_trades:
+        today_news = [f"{t['ticker']} {t['reason']} {t['net_pct']:+.2f}%" for t in news_trades if t["day"] == day]
+        lines.append(f"[실거래 조건 + 뉴스 필터] 오늘 {', '.join(today_news) or '없음'} | {_stats_line(news_trades)}")
+    today_verdicts = [v for v in soxl_news.read_verdicts() if v["at"][:10] == day and v.get("verdict")]
+    if today_verdicts:
+        lines.append("[뉴스 판단] " + " → ".join(f"{v['at'][11:16]} {v['verdict']}" for v in today_verdicts))
     return "\n".join(lines)
+
+
+def _refresh_news(now: datetime) -> None:
+    try:
+        soxl_news.refresh_if_due(now)
+    except Exception as e:
+        print(f"⚠️ [SOXL 뉴스] 판단 실패: {type(e).__name__}: {e}")
 
 
 def loop() -> None:
@@ -357,7 +385,12 @@ def loop() -> None:
     while True:
         now = now_ny()
         bounds = session_bounds(now.date()) if is_trading_day(now.date()) else None
+        if bounds and bounds[0] - timedelta(minutes=30) <= now < bounds[0] + BAR:
+            _refresh_news(now)  # 개장 전에 첫 뉴스 판단을 만들어 둔다
+            time_mod.sleep(60)
+            continue
         if bounds and bounds[0] + BAR <= now <= bounds[1] + timedelta(minutes=10):
+            _refresh_news(now)
             try:
                 run_once(now)
             except Exception as e:

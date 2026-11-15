@@ -9,6 +9,8 @@
   · 하루 최대 2번 진입: 종목별 당일 재진입 차단(trading_safety)을 그대로 따르므로 SOXL 1번 + SOXS 1번까지
   · 마감 10분 전 정리, 오버나잇 홀딩 안 함, 보유 칸(max_holdings) 1칸 사용
   · 1주 고정이라 진입 단가 $50 상한·최소 주문 금액 예외. 종목당 계좌 1/2 상한은 지킨다
+뉴스 1차 필터(soxl_news, 사용자 요청 2026-11-15): 악재면 SOXL, 호재면 SOXS 신호를 진입하지 않는다.
+  SOXL_NEWS_FILTER=on(기본)/log/off. 뉴스 판단이 없거나 45분보다 오래됐으면 기술 신호대로 (막지 않음)
 스위치가 꺼져 있으면 이 모듈은 아무것도 하지 않고, SOXL을 들고 있더라도 엔진의 일반 기준으로 관리된다.
 """
 
@@ -17,6 +19,7 @@ import os
 import pandas as pd
 import yfinance as yf
 
+import soxl_news
 import soxl_paper
 from market_calendar import NY_TZ, now_ny, session_bounds
 
@@ -73,7 +76,7 @@ def _soxx_frame(now) -> pd.DataFrame | None:
     return soxl_paper.indicators(df)
 
 
-def check_signal(now=None, frame_fn=_soxx_frame) -> dict | None:
+def check_signal(now=None, frame_fn=_soxx_frame, news_fn=soxl_news.latest_at) -> dict | None:
     """마지막 완성 봉에서 진입 신호를 본다. {"ticker", "bar", "reason"} 또는 None. 같은 봉은 한 번만 판단"""
     global _last_checked_bar
     now = now or now_ny()
@@ -97,12 +100,23 @@ def check_signal(now=None, frame_fn=_soxx_frame) -> dict | None:
     if not direction:
         return None
     row = base.iloc[i]
+    ticker = "SOXL" if direction > 0 else "SOXS"
     trend = "상승 추세 속 눌림 반등" if direction > 0 else "하락 추세 속 반등 실패"
-    return {
-        "ticker": "SOXL" if direction > 0 else "SOXS",
-        "bar": ts,
-        "reason": f"SOXX {ts.strftime('%H:%M')} 봉 {trend} (종가 ${row['Close']:.2f}, EMA20 ${row['ema20']:.2f}, VWAP ${row['vwap']:.2f})",
-    }
+    reason = f"SOXX {ts.strftime('%H:%M')} 봉 {trend} (종가 ${row['Close']:.2f}, EMA20 ${row['ema20']:.2f}, VWAP ${row['vwap']:.2f})"
+    news_mode = soxl_news.mode()
+    if news_mode != "off":
+        try:
+            verdict = news_fn(now)
+        except Exception as e:
+            print(f"⚠️ [SOXL 실거래] 뉴스 판단 읽기 실패: {type(e).__name__}: {e}")
+            verdict = None
+        reason += f" | {soxl_news.describe(verdict)}"
+        if soxl_news.blocks(ticker, verdict):
+            tag = "진입 안 함" if news_mode == "on" else "기록만, 진입은 함 (SOXL_NEWS_FILTER=log)"
+            print(f"📰 [SOXL 뉴스 필터] {ticker} 기술 신호를 뉴스가 막음: {reason} → {tag}")
+            if news_mode == "on":
+                return None
+    return {"ticker": ticker, "bar": ts, "reason": reason}
 
 
 def quote_price(client, ticker: str) -> float:
