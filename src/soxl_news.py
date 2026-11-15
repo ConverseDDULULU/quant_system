@@ -94,11 +94,21 @@ def judge(headlines: list[dict], generate=generate_text) -> dict:
 
 
 def read_verdicts(path: str | None = None) -> list[dict]:
+    """깨진 줄(쓰다가 잘린 줄 등)은 건너뛴다. 파일 전체를 버리면 필터가 꺼지고 Gemini를 매번 부르게 된다"""
+    out = []
     try:
         with open(path or VERDICTS_PATH, encoding="utf-8") as f:
-            return [json.loads(line) for line in f if line.strip()]
-    except (FileNotFoundError, ValueError):
-        return []
+            for line in f:
+                try:
+                    v = json.loads(line) if line.strip() else None
+                    if isinstance(v, dict) and v.get("at"):
+                        datetime.fromisoformat(v["at"])
+                        out.append(v)
+                except (ValueError, TypeError):
+                    continue
+    except FileNotFoundError:
+        pass
+    return out
 
 
 def latest_at(when: datetime, path: str | None = None, max_age_minutes: int = MAX_AGE_MINUTES) -> dict | None:
