@@ -427,6 +427,7 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
         INITIAL_BALANCE = risk_state["starting_balance"] or current_equity
     # 1단계: 보유 종목 동적 익절/손절 감시
     held_tickers = []
+    soxl_committed = 0.0  # SOXL·SOXS에 들어가 있는 돈 (예약 계산용: 보유 매입 금액 + 대기 매수)
 
     if holdings:
         print(f"📋 [보유 계좌 잔고 감시 ({len(holdings)}개 종목 추적 중)]")
@@ -438,6 +439,8 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
 
             held_tickers.append(ticker)
             buy_price = float(item.get("frgn_stk_book_uv", 0.0))
+            if ticker in soxl_live.TICKERS:
+                soxl_committed += buy_price * qty
             now_price = float(item.get("now_pric", 0.0))
             profit_rate = float(item.get("pl_rt", 0.0))
 
@@ -567,6 +570,7 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
             f"주문가능 ${usd_available:.2f}는 키움이 이미 차감한 값)"
         )
         held_tickers.extend(t for t in pending_buys if t not in held_tickers)
+        soxl_committed += pending_orders.reserved_cash([o for o in pending if o.get("ticker") in soxl_live.TICKERS])
 
     # 개장 직후 N분은 변동성·호가 차이가 크고 거래량 배수가 부풀어 신규 매수(인버스 포함)를 하지 않는다.
     # 손절·익절·청산은 위 1단계에서 이미 처리돼 영향 없음
@@ -578,17 +582,31 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
     MAX_HOLDINGS = PARAMS["max_holdings"]
 
     # SOXL·SOXS 단타 (SOXL_LIVE=on일 때만). 하락장·장세 필터보다 먼저 본다 (SOXS가 하락 쪽 진입)
-    soxl_bought = _try_soxl_entry(client, held_tickers, usd_available, MAX_HOLDINGS, dry_run)
+    soxl_bought = _try_soxl_entry(client, held_tickers, usd_available, dry_run)
     if soxl_bought:
         held_tickers.append(soxl_bought[0])
         usd_available -= soxl_bought[1]
+        soxl_committed += soxl_bought[1]
+
+    # 일반 매매는 SOXL 예약을 뺀 돈으로만 (SOXL_LIVE=off면 예약 0이라 예전과 같음)
+    #  · 기준 금액: 당일 시작 평가액 - 예약 → 한 종목 예산은 그 1/2
+    #  · 쓸 수 있는 현금: 주문가능 외화 - (예약 중 SOXL·SOXS에 아직 안 들어간 나머지)
+    soxl_reserve = soxl_live.reserve_usd()
+    regular_equity = max(0.0, (INITIAL_BALANCE or usd_available) - soxl_reserve)
+    regular_cash = max(0.0, usd_available - soxl_live.cash_hold(soxl_committed))
+    regular_held = [t for t in held_tickers if not soxl_live.manages(t)]  # SOXL·SOXS는 전용 칸이라 세지 않음
+    if soxl_reserve:
+        print(
+            f"💵 [SOXL 예약 ${soxl_reserve:.0f}] 일반 매매 기준 금액 ${regular_equity:.2f}, 쓸 수 있는 현금 ${regular_cash:.2f} "
+            f"(SOXL·SOXS에 들어간 돈 ${soxl_committed:.2f})"
+        )
 
     # 하락장 대응: 하락 추세 + 악재 확인 시 일반 매수 대신 1배 인버스 ETF 진입 (bear_mode.py)
     if bear_mode.is_enabled():
         is_bear, bear_reason = bear_mode.detect_bear_market(client)
         if is_bear:
             print(f"🐻 [하락장 감지] {bear_reason}")
-            try_inverse_entry(client, held_tickers, usd_available, MAX_HOLDINGS, bear_reason, dry_run)
+            try_inverse_entry(client, held_tickers, regular_held, regular_equity, regular_cash, MAX_HOLDINGS, bear_reason, dry_run)
             return
 
     market_ok, market_reason = market_trend_allows_entries(client)
@@ -596,14 +614,14 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
         print(f"📉 [시장 장세 필터] 신규 매수 차단: {market_reason}")
         return
 
-    if len(held_tickers) >= MAX_HOLDINGS:
+    if len(regular_held) >= MAX_HOLDINGS:
         print(
-            f"\n🔒 [보유 슬롯 만석] 현재 {len(held_tickers)}/{MAX_HOLDINGS} 종목 보유 중으로 신규 매수를 대기합니다."
+            f"\n🔒 [보유 슬롯 만석] 현재 {len(regular_held)}/{MAX_HOLDINGS} 종목 보유 중으로 신규 매수를 대기합니다."
         )
         return
 
     # [안전장치 2] 1종목 몰빵 방지: 진입 단가 $50 이하, 한 종목 매수 금액은 당일 시작 평가액의 1/2 이하
-    position_budget = position_budget_usd(INITIAL_BALANCE or usd_available, usd_available)
+    position_budget = position_budget_usd(regular_equity, regular_cash)
     max_entry_price = min(position_budget, 50.0)
 
     target_stocks = get_pre_breakout_stocks(
@@ -672,14 +690,14 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
 
                 buy_qty = max_position_qty(
                     numeric_price,
-                    INITIAL_BALANCE or usd_available,
-                    usd_available,
+                    regular_equity,
+                    regular_cash,
                     PARAMS["max_buy_qty"],
                 )
                 if buy_qty <= 0:
                     print(
                         f"   ⚠️ [주문 스킵] {ticker} 단가(${numeric_price:.2f})가 한 종목 예산"
-                        f"(${position_budget_usd(INITIAL_BALANCE or usd_available, usd_available):.2f})보다 큽니다."
+                        f"(${position_budget_usd(regular_equity, regular_cash):.2f})보다 큽니다."
                     )
                     continue
                 if buy_qty * numeric_price < PARAMS["min_order_usd"]:
@@ -715,6 +733,7 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
                     finish_ticker_buy(ticker, accepted=True)
                     TODAY_BOUGHT.append(ticker)
                     usd_available -= numeric_price * buy_qty
+                    regular_cash -= numeric_price * buy_qty
                     branch_label = {"strict": "기본 조건", "aggressive": "공격 모드 완화"}.get(branch, branch)
                     send_discord_message(
                         f"✅ **[매수 주문 접수 성공]** {ticker} {buy_qty}주\n"
@@ -754,7 +773,7 @@ def minutes_since_open() -> float | None:
     return (now - bounds[0]).total_seconds() / 60
 
 
-def _try_soxl_entry(client, held_tickers, usd_available, max_holdings, dry_run) -> tuple[str, float] | None:
+def _try_soxl_entry(client, held_tickers, usd_available, dry_run) -> tuple[str, float] | None:
     """SOXL·SOXS 단타 진입 (soxl_live). 주문이 접수되면 (종목, 주문 금액), 아니면 None
 
     어떤 오류가 나도 예외를 밖으로 내지 않는다 (일반 매수 탐색은 계속).
@@ -772,9 +791,7 @@ def _try_soxl_entry(client, held_tickers, usd_available, max_holdings, dry_run) 
             return None
         ticker = signal["ticker"]
         print(f"📈 [SOXL 단타 신호] {ticker}: {signal['reason']} | 분기: {soxl_live.BRANCH}")
-        if len(held_tickers) >= max_holdings:
-            print(f"   ⏸️ [SOXL 단타] 보유 칸 만석 ({len(held_tickers)}/{max_holdings}), 진입 안 함")
-            return None
+        # 전용 칸: 일반 종목이 보유 칸을 다 채워도 들어간다 (사용자 결정 2026-11-16)
         if ticker in done_today:
             print(f"   ⏸️ [SOXL 단타] 오늘 이미 {ticker}를 주문해 다시 사지 않음 (종목별 하루 1번)")
             return None
@@ -784,9 +801,9 @@ def _try_soxl_entry(client, held_tickers, usd_available, max_holdings, dry_run) 
             return None
         limit_price = format_us_price(price * soxl_live.BUY_LIMIT_PREMIUM)
         cost = limit_price * soxl_live.QTY
-        budget = position_budget_usd(INITIAL_BALANCE or usd_available, usd_available)
-        if cost > budget:
-            print(f"   ⏸️ [SOXL 단타] {ticker} {soxl_live.QTY}주 ${cost:.2f} > 한 종목 예산 ${budget:.2f}, 진입 안 함")
+        reserve = soxl_live.reserve_usd()
+        if cost > reserve:
+            print(f"   ⏸️ [SOXL 단타] {ticker} {soxl_live.QTY}주 ${cost:.2f} > SOXL 예약 ${reserve:.2f}, 진입 안 함")
             return None
         if cost > usd_available:
             print(f"   ⏸️ [SOXL 단타] 주문가능 외화 ${usd_available:.2f} < ${cost:.2f}, 진입 안 함")
@@ -822,14 +839,14 @@ def _try_soxl_entry(client, held_tickers, usd_available, max_holdings, dry_run) 
         return None
 
 
-def try_inverse_entry(client, held_tickers, usd_available, max_holdings, bear_reason, dry_run):
+def try_inverse_entry(client, held_tickers, regular_held, equity, usd_available, max_holdings, bear_reason, dry_run):
     """하락장에서 1배 인버스 ETF를 한 종목만 매수 (악재 확인·상승 탄력·종목당 예산 적용)"""
     inverse_tickers = {t for t, _ in bear_mode.INVERSE_ETFS}
     if inverse_tickers & set(held_tickers):
         print("   🐻 [하락장 대응] 이미 인버스 ETF 보유 중, 추가 매수 안 함")
         return
-    if len(held_tickers) >= max_holdings:
-        print(f"   🐻 [하락장 대응] 보유 슬롯 만석 ({len(held_tickers)}/{max_holdings})")
+    if len(regular_held) >= max_holdings:
+        print(f"   🐻 [하락장 대응] 보유 슬롯 만석 ({len(regular_held)}/{max_holdings})")
         return
 
     news_bad, news_reason = bear_mode.confirm_bad_news()
@@ -844,8 +861,8 @@ def try_inverse_entry(client, held_tickers, usd_available, max_holdings, bear_re
         return
     ticker, exchange_code = pick["ticker"], pick["exchange"]
     numeric_price = format_us_price(pick["price"])
-    budget = position_budget_usd(INITIAL_BALANCE or usd_available, usd_available)
-    buy_qty = max_position_qty(numeric_price, INITIAL_BALANCE or usd_available, usd_available, PARAMS["max_buy_qty"])
+    budget = position_budget_usd(equity, usd_available)
+    buy_qty = max_position_qty(numeric_price, equity, usd_available, PARAMS["max_buy_qty"])
     print(f"   🐻 [하락장 대응] {ticker} ${numeric_price:.2f} x {buy_qty}주 (한 종목 예산 ${budget:.2f}) | 분기: inverse")
     if buy_qty * numeric_price < PARAMS["min_order_usd"]:
         print(f"   🐻 [하락장 대응] 주문 금액 ${buy_qty * numeric_price:.2f} < 최소 주문 ${PARAMS['min_order_usd']}, 진입 안 함")

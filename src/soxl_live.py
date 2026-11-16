@@ -7,8 +7,12 @@
   · 진입 신호는 soxl_paper와 같은 로직(SOXX 5분봉 추세 속 눌림, soxl_paper.signal_direction 공용)
   · 개장 15분 뒤 ~ 마감 90분 전 봉에서만 판단, SOXL과 SOXS 중 한 번에 하나만 보유
   · 하루 최대 2번 진입: 종목별 당일 재진입 차단(trading_safety)을 그대로 따르므로 SOXL 1번 + SOXS 1번까지
-  · 마감 10분 전 정리, 오버나잇 홀딩 안 함, 보유 칸(max_holdings) 1칸 사용
-  · 1주 고정이라 진입 단가 $50 상한·최소 주문 금액 예외. 종목당 계좌 1/2 상한은 지킨다
+  · 마감 10분 전 정리, 오버나잇 홀딩 안 함
+전용 칸·예약 (사용자 결정 2026-11-16, "200달러는 그대로, 100달러로 SOXL·SOXS 1주 단타"):
+  · SOXL·SOXS는 일반 보유 칸(max_holdings)과 별도인 전용 칸 1개를 쓴다 (둘 중 하나만)
+  · 예약 금액(SOXL_RESERVE_USD, 기본 $100)을 일반 매매 기준 금액·주문가능 현금에서 뺀다
+    SOXL·SOXS를 들고 있거나 대기 매수 중이면 그 매입 금액은 이미 쓴 것으로 보고 나머지만 남겨 둔다
+  · 1주 가격이 예약 금액보다 비싸면 사지 않는다. 진입 단가 $50 상한·최소 주문 금액은 적용하지 않는다
 뉴스 1차 필터(soxl_news, 사용자 요청 2026-11-15): 악재면 SOXL, 호재면 SOXS 신호를 진입하지 않는다.
   SOXL_NEWS_FILTER=on(기본)/log/off. 뉴스 판단이 없거나 45분보다 오래됐으면 기술 신호대로 (막지 않음)
 스위치가 꺼져 있으면 이 모듈은 아무것도 하지 않고, SOXL을 들고 있더라도 엔진의 일반 기준으로 관리된다.
@@ -30,6 +34,7 @@ QTY = 1
 STOP_LOSS_PCT = -2.5
 TAKE_PROFIT_PCT = 5.0
 MAX_ENTRIES_PER_DAY = 2
+DEFAULT_RESERVE_USD = 100.0  # 사용자 결정 2026-11-16: $300 중 $100은 SOXL·SOXS 단타 몫, 일반 매매는 나머지
 BUY_LIMIT_PREMIUM = 1.002  # 지정가 매수를 현재가보다 0.2% 위에 내 체결되게 (실제 체결은 매도호가)
 
 _last_checked_bar = None  # 이미 판단한 SOXX 5분봉 (같은 봉으로 두 번 진입하지 않게)
@@ -37,6 +42,22 @@ _last_checked_bar = None  # 이미 판단한 SOXX 5분봉 (같은 봉으로 두 
 
 def is_enabled() -> bool:
     return os.getenv("SOXL_LIVE", "off").strip().lower() == "on"
+
+
+def reserve_usd() -> float:
+    """SOXL·SOXS 몫으로 떼어 두는 금액 (서버 .env SOXL_RESERVE_USD, 기본 $100). 스위치가 꺼져 있으면 0"""
+    if not is_enabled():
+        return 0.0
+    try:
+        value = float(os.getenv("SOXL_RESERVE_USD", "").strip() or DEFAULT_RESERVE_USD)
+    except ValueError:
+        value = DEFAULT_RESERVE_USD
+    return max(0.0, value)
+
+
+def cash_hold(committed_usd: float) -> float:
+    """일반 매수가 쓰지 말아야 할 현금: 예약 금액 중 SOXL·SOXS(보유·대기 매수)에 아직 안 들어간 나머지"""
+    return max(0.0, reserve_usd() - max(0.0, committed_usd))
 
 
 def manages(ticker: str) -> bool:
