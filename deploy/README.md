@@ -108,7 +108,7 @@ gcloud compute ssh <VM이름> --zone asia-northeast3-a -- -L 8000:localhost:8000
 
 ### SOXL·SOXS 단타 실거래 (실주문, 2026-11-11 켬)
 
-`src/soxl_live.py`. 매매 엔진(`quant-scheduler`) 안에서 돌고, 서버 `config/.env`의 `SOXL_LIVE=on`일 때만 동작해요. 조건(사용자 결정)은 1주, 손절 수익률 -2.5%, 익절 +5%, 마감 10분 전 정리, 종목별 하루 1번이에요. 서킷브레이커는 그대로 적용돼요.
+`src/soxl_live.py`. 매매 엔진(`quant-scheduler`) 안에서 돌고, 서버 `config/.env`의 `SOXL_LIVE=on`일 때만 동작해요. 조건(사용자 결정)은 1주, 손절 수익률 -2.5%, 익절 +5%, 마감 10분 전 정리, 종목별 하루 1번이에요. 서킷브레이커는 그대로 적용돼요. 2026-11-16부터는 일반 보유 칸과 별도인 전용 칸을 쓰고, `.env`의 `SOXL_RESERVE_USD`(없으면 $100)를 SOXL·SOXS 몫으로 떼어 둬요. 일반 매매는 나머지 금액으로만 해요.
 
 | 하고 싶은 것 | 명령 (서버) |
 |---|---|
