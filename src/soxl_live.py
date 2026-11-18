@@ -28,7 +28,8 @@ import soxl_paper
 from market_calendar import NY_TZ, now_ny, session_bounds
 
 TICKERS = ("SOXL", "SOXS")
-EXCHANGE = "NA"  # 키움 거래소 코드 (AMEX·NYSE Arca)
+EXCHANGE = "NY"  # 키움 거래소 코드. NYSE Arca 상장이지만 키움은 NY로 받는다 (11/17 NA 요청은 "1903: 종목 정보가 없습니다",
+#                  키움 usa10098 조회는 SOXL·SOXS 모두 NY). trading_safety.KNOWN_EXCHANGE_CODES(매도 거래소)와 같게
 BRANCH = "soxl"
 QTY = 1
 STOP_LOSS_PCT = -2.5
