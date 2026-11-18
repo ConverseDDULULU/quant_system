@@ -30,7 +30,13 @@ def safe_float(val, default: float = 0.0) -> float:
 
 
 # AMEX(NA)에서 매수를 허용하는 종목 (그 밖의 NA 종목은 매수 차단, 매도는 거래소와 무관하게 허용)
-AMEX_BUY_TICKERS = frozenset({"SOXL", "SOXS"})
+# SOXL·SOXS는 키움에서 NY(usa10098 확인, 2026-11-17)라 여기 넣지 않는다
+AMEX_BUY_TICKERS = frozenset()
+
+# 키움 연결(TCP) 대기 시간과 연결 실패 재시도. 연결이 안 된 요청은 키움에 닿지 않았으므로
+# 주문이라도 한 번 다시 보내도 중복 주문이 되지 않는다 (응답 대기 시간 초과는 재시도하지 않음)
+CONNECT_TIMEOUT_SECONDS = 3.05
+CONNECT_RETRY_DELAY_SECONDS = 0.5
 
 
 class KiwoomClient:
@@ -143,14 +149,29 @@ class KiwoomClient:
 
     def _post(self, url: str, headers: dict, json: dict, timeout: float):
         """키움 POST. 토큰 무효(8005)면 다시 로그인하고 새 토큰으로 한 번만 재시도한다."""
-        res = requests.post(url, headers=headers, json=json, timeout=timeout)
+        res = self._send(url, headers, json, timeout)
         if self._is_auth_error(res):
             print(f"🔄 [KiwoomClient] 토큰 무효({headers.get('api-id')}), 재로그인 후 재시도합니다.")
             self.authenticate()
             retry_headers = dict(headers)
             retry_headers["authorization"] = f"Bearer {self.access_token}"
-            res = requests.post(url, headers=retry_headers, json=json, timeout=timeout)
+            res = self._send(url, retry_headers, json, timeout)
         return res
+
+    @staticmethod
+    def _send(url: str, headers: dict, json: dict, timeout: float):
+        """연결 대기는 짧게(약 3초), 응답 대기는 timeout. 연결 시간 초과면 0.5초 뒤 한 번만 다시 시도한다."""
+        connect_timeout = min(CONNECT_TIMEOUT_SECONDS, float(timeout))
+        started = time.monotonic()
+        try:
+            return requests.post(url, headers=headers, json=json, timeout=(connect_timeout, timeout))
+        except requests.exceptions.ConnectTimeout:
+            print(
+                f"🔁 [키움 연결 재시도] {headers.get('api-id')}: "
+                f"{time.monotonic() - started:.1f}초 동안 연결 안 됨, 한 번 다시 시도"
+            )
+        time.sleep(CONNECT_RETRY_DELAY_SECONDS)
+        return requests.post(url, headers=headers, json=json, timeout=(connect_timeout, timeout))
 
     def get_us_holdings(self) -> list:
         """미국주식 원장잔고확인 (ust21070)"""
@@ -904,7 +925,7 @@ class KiwoomClient:
         if is_buy and exchange_code not in {"ND", "NY"} and not is_allowed_amex:
             return {
                 "return_code": -1,
-                "return_msg": f"NASDAQ·NYSE 또는 SOXL·SOXS(NA)만 매수할 수 있습니다: {ticker} (거래소 {exchange_code})",
+                "return_msg": f"NASDAQ·NYSE 종목만 매수할 수 있습니다: {ticker} (거래소 {exchange_code})",
             }
 
         self._ensure_token()

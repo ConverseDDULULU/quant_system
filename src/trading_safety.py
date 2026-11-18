@@ -21,7 +21,7 @@ STOP_LOSS_PCT = -1.8
 TAKE_PROFIT_PCT = 3.5
 MAX_TAKE_PROFIT_PCT = 7.0
 MAX_POSITION_FRACTION = 0.5  # 한 종목 매수 금액 상한: 계좌 평가액의 1/2
-KNOWN_EXCHANGE_CODES = {"GRAB": "ND", "RIOT": "ND", "SOXL": "NA", "SOXS": "NA"}  # SOXL·SOXS는 NYSE Arca → 키움 NA (soxl_live.EXCHANGE와 같게)
+KNOWN_EXCHANGE_CODES = {"GRAB": "ND", "RIOT": "ND", "SOXL": "NY", "SOXS": "NY"}  # SOXL·SOXS(NYSE Arca)는 키움 NY (usa10098 확인 2026-11-17, soxl_live.EXCHANGE와 같게)
 
 _market_cache_lock = threading.Lock()
 _market_cache_time = 0.0
@@ -213,8 +213,8 @@ def get_rotating_us_candidates(
     for row in ranked_rows:
         ticker = str(row.get("stk_cd", "")).strip().upper()
         exchange = str(row.get("stex_tp", "")).strip().upper()
-        # 매수 허용 거래소: NASDAQ·NYSE, AMEX는 SOXL만 (kiwoom_client.order_us_stock과 같은 기준)
-        if not ticker or (exchange not in ("ND", "NY") and not (ticker == "SOXL" and exchange == "NA")):
+        # 매수 허용 거래소: NASDAQ·NYSE (kiwoom_client.order_us_stock과 같은 기준, SOXL·SOXS도 키움 NY)
+        if not ticker or exchange not in ("ND", "NY"):
             continue
         try:
             # cur_prc·거래량은 등락 부호가 붙어 올 수 있어 절댓값, 등락률은 부호 유지

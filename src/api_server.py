@@ -385,7 +385,7 @@ def real_trading_engine():
             ticker = candidate["ticker"]
             try:
                 exchange_code = candidate.get("exchange") or get_kiwoom_exchange_code(ticker)
-                is_soxl_amex = ticker == "SOXL" and exchange_code == "NA"
+                is_soxl_amex = ticker == "SOXL" and exchange_code == "NY"  # 키움에서 SOXL은 NY
                 if exchange_code != "ND" and not is_soxl_amex and ticker not in active_positions:
                     print(f"⏭️ [NASDAQ 전용] {ticker} 매수 스캔 제외 (거래소: {exchange_code})")
                     continue
