@@ -21,6 +21,7 @@ from datetime import datetime, timedelta
 import yfinance as yf
 
 from gemini_client import generate_text
+from market_calendar import session_bounds
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 VERDICTS_PATH = os.path.join(PROJECT_ROOT, "data", "soxl_paper", "news_verdicts.jsonl")
@@ -31,7 +32,13 @@ PER_QUERY = 8
 MAX_HEADLINES = 30
 LOOKBACK_HOURS = 24
 REFRESH_MINUTES = 30
-RETRY_MINUTES = 5  # 직전 판단이 실패(판단 없음)였으면 이 간격으로 다시
+# 실패 뒤 다시 시도 간격: 연속 실패 횟수만큼 두 배씩 (5→10→20→40→60분). 11/17 Gemini 한도 초과(429) 때
+# 5분마다 무한히 다시 불러 하루 76번이 됐다 (2026-11-18 1번 지적)
+RETRY_MINUTES = 5
+RETRY_MAX_MINUTES = 60
+MAX_CALLS_PER_DAY = 16  # 하루(뉴욕 날짜) 판단 시도 상한. 정상이면 하루 약 12번
+START_BEFORE_OPEN_MIN = 30  # 개장 30분 전부터
+END_BEFORE_CLOSE_MIN = 90  # 마감 90분 전까지만 (그 뒤엔 SOXL 진입이 없어 판단할 필요 없음, soxl_paper.ENTRY_END_MIN과 같음)
 MAX_AGE_MINUTES = 45  # 이보다 오래된 판단은 '판단 없음'으로 본다
 VERDICTS = ("호재", "중립", "악재")
 
@@ -136,17 +143,39 @@ def describe(verdict: dict | None) -> str:
     return f"뉴스 {verdict['verdict']} ({datetime.fromisoformat(verdict['at']).strftime('%H:%M')}): {verdict['reason']}"
 
 
+def _due(now: datetime, past: list[dict]) -> tuple[bool, str]:
+    """지금 판단할 차례인지와 이유"""
+    bounds = session_bounds(now.date())
+    if not bounds:
+        return False, "휴장일"
+    open_dt, close_dt = bounds
+    if not (open_dt - timedelta(minutes=START_BEFORE_OPEN_MIN) <= now <= close_dt - timedelta(minutes=END_BEFORE_CLOSE_MIN)):
+        return False, "판단 시간 밖"
+    today = [v for v in past if datetime.fromisoformat(v["at"]).date() == now.date()]
+    if len(today) >= MAX_CALLS_PER_DAY:
+        return False, f"하루 상한 {MAX_CALLS_PER_DAY}번"
+    if not today:
+        return True, "오늘 첫 판단"
+    failures = 0
+    for v in reversed(today):
+        if v.get("verdict"):
+            break
+        failures += 1
+    wait = REFRESH_MINUTES if not failures else min(RETRY_MINUTES * 2 ** (failures - 1), RETRY_MAX_MINUTES)
+    if now - datetime.fromisoformat(today[-1]["at"]) < timedelta(minutes=wait):
+        return False, f"{wait}분 대기"
+    return True, f"연속 실패 {failures}번 뒤 재시도" if failures else "정기 판단"
+
+
 def refresh_if_due(now: datetime, path: str | None = None, fetch=fetch_headlines, generate=generate_text) -> dict | None:
-    """마지막 판단이 REFRESH_MINUTES보다 오래됐으면 새로 판단해 파일에 붙인다 (모의 프로그램이 장중에 부른다)"""
+    """판단할 차례면(정규장 판단 시간 안, 하루 상한 안, 대기 시간 지남) 새로 판단해 파일에 붙인다 (모의 프로그램이 부른다)"""
     path = path or VERDICTS_PATH
-    past = read_verdicts(path)
-    if past:
-        wait = REFRESH_MINUTES if past[-1].get("verdict") else RETRY_MINUTES
-        if now - datetime.fromisoformat(past[-1]["at"]) < timedelta(minutes=wait):
-            return None
+    due, why = _due(now, read_verdicts(path))
+    if not due:
+        return None
     result = {"at": now.isoformat(), **judge(fetch(), generate)}
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(result, ensure_ascii=False) + "\n")
-    print(f"📰 [SOXL 뉴스] {result['verdict'] or '판단 없음'} | 헤드라인 {result['count']}개 | {result['reason']}")
+    print(f"📰 [SOXL 뉴스] {result['verdict'] or '판단 없음'} | 헤드라인 {result['count']}개 | {result['reason']} ({why})")
     return result
