@@ -60,6 +60,10 @@ gcloud compute ssh <VM이름> --zone asia-northeast3-a --command "cd quant_syste
 | 코드 업데이트 반영 | `cd quant_system && bash deploy/update.sh` |
 | 매매 긴급 중지 | `sudo systemctl stop quant-scheduler` |
 | 다시 시작 | `sudo systemctl start quant-scheduler` |
+| 매매 쉬기 (재부팅·`update.sh`에도 안 켜짐) | `sudo systemctl disable --now quant-scheduler claude-review.timer` |
+| 쉬던 매매 다시 켜기 | `sudo systemctl enable --now quant-scheduler claude-review.timer` |
+
+> 쉬기 전에 보유 종목이 없는지 확인해요. 엔진이 꺼져 있으면 손절·익절 점검도 하지 않아요.
 
 ## 6. 대시보드를 로컬에서 보기
 
