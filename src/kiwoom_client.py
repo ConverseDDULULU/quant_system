@@ -975,10 +975,46 @@ class KiwoomClient:
             res = self._post(url, headers=headers, json=body, timeout=10)
             data = res.json()
             print(f"📦 [키움 주문 원본 응답]: {data}")
-            return data
         except Exception as e:
             print(f"⚠️ 주문 전송 예외 발생: {e}")
-            return {"return_code": -1, "return_msg": str(e)}
+            return {"return_code": -1, "return_msg": str(e), "accepted": False}
+
+        if not isinstance(data, dict):
+            data = {"return_code": -1, "return_msg": f"알 수 없는 응답: {data}"}
+        accepted = str(data.get("return_code", "")).strip() == "0"
+        data["accepted"] = accepted
+        if not accepted:
+            data["rejected"] = True
+            side = "매수" if is_buy else "매도"
+            print(
+                f"❌ [키움 주문 거부] {side} {ticker.upper().strip()} {qty}주 @ ${formatted_price} ({exchange_code}): "
+                f"[{data.get('return_code')}] {data.get('return_msg', '응답 없음')}"
+            )
+            self._notify_order_rejected(side, ticker.upper().strip(), qty, formatted_price, exchange_code, data)
+        return data
+
+    def _notify_order_rejected(self, side, ticker, qty, price, exchange_code, data) -> None:
+        """키움이 거부한 주문을 Discord로 알린다. 같은 종목·같은 거부 사유는 뉴욕 날짜 기준 하루 한 번만"""
+        webhook = os.getenv("DISCORD_WEBHOOK_URL")
+        if not webhook:
+            return
+        day = datetime.now(pytz.timezone("America/New_York")).date().isoformat()
+        key = (day, side, ticker, str(data.get("return_code")), str(data.get("return_msg", "")))
+        sent = getattr(self, "_rejection_alerts", None)
+        if sent is None:
+            sent = self._rejection_alerts = set()
+        if key in sent:
+            return
+        sent.add(key)
+        content = (
+            f"❌ **[키움 주문 거부]** {side} {ticker} {qty}주 @ ${price} ({exchange_code})\n"
+            f"- 키움 응답: [{data.get('return_code')}] {data.get('return_msg', '응답 없음')}\n"
+            f"- 주문은 들어가지 않았어요. 같은 사유는 오늘 다시 알리지 않아요."
+        )
+        try:
+            requests.post(webhook, json={"content": content}, timeout=5)
+        except Exception as e:
+            print(f"⚠️ 주문 거부 알림 전송 실패: {e}")
 
 
 if __name__ == "__main__":
