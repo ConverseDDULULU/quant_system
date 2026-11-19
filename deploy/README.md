@@ -122,12 +122,28 @@ gcloud compute ssh <VM이름> --zone asia-northeast3-a -- -L 8000:localhost:8000
 
 > 끄기는 SOXL·SOXS를 들고 있지 않을 때나 장외 시간에 해요. 들고 있는데 끄면 다음 점검부터 일반 기준(-1.8%)이 적용돼 바로 손절될 수 있어요.
 
-**뉴스 1차 필터** (`src/soxl_news.py`, 2026-11-15 추가): 모의 서비스(`quant-soxl-paper`)가 장중 30분마다 반도체·시장 뉴스를 Gemini로 호재/중립/악재로 판정해 `data/soxl_paper/news_verdicts.jsonl`에 쌓아요. 엔진은 그 파일만 읽고, 악재면 SOXL, 호재면 SOXS 신호에서 진입하지 않아요. 판정이 없거나 45분보다 오래됐으면 기술 신호대로 해요. 스위치는 `.env`의 `SOXL_NEWS_FILTER`예요. 값은 `on`(기본, 줄이 없어도 on), `log`(기록만), `off`가 있고, 바꾸면 `quant-scheduler`를 재시작해요.
+**뉴스 1차 필터** (`src/soxl_news.py`, 2026-11-15 추가): 모의 서비스(`quant-soxl-paper`)가 장중 30분마다 반도체·시장 뉴스를 Gemini로 호재/중립/악재로 판정해 `data/soxl_paper/news_verdicts.jsonl`에 쌓아요. 엔진은 그 파일만 읽고, 악재면 SOXL, 호재면 SOXS 신호에서 진입하지 않아요. 판정이 없거나 45분보다 오래됐으면 진입하지 않아요(2026-11-19부터, 그 전에는 기술 신호대로 샀어요). 키움이 SOXL·SOXS 매수를 거부하면 그날은 더 시도하지 않아요. 스위치는 `.env`의 `SOXL_NEWS_FILTER`예요. 값은 `on`(기본, 줄이 없어도 on), `log`(기록만), `off`가 있고, 바꾸면 `quant-scheduler`를 재시작해요.
 
 | 하고 싶은 것 | 명령 (서버) |
 |---|---|
 | 오늘 뉴스 판정 | `cd quant_system && tail -5 data/soxl_paper/news_verdicts.jsonl` |
 | 차단된 신호 | `journalctl -u quant-scheduler --since today -o cat \| grep 'SOXL 뉴스 필터'` |
+
+### 우량·가치주 보유 (실주문, 2026-11-19 켬)
+
+`src/value_hold.py`. 매매 엔진 안에서 돌고, 서버 `config/.env`의 `VALUE_HOLD=on`일 때만 동작해요(줄이 없으면 꺼짐). 사용자 결정은 "급등주 단타 대신 우량·가치주를 사서 들고 가기, 익절·손절 없이, SOXL은 유지"예요.
+- 고르기: 하루 한 번 뒤에서(약 1분) 시총 $100억 이상, PER·ROE·영업이익률·부채비율·현금흐름·베타 기준으로 걸러 `data/value_hold/screen.json`에 저장해요.
+- 사기: 뉴욕 10:00~15:00, 하루 1종목, 20일 평균 이하로 눌린 종목만 사요. 일반 보유 칸과 한 종목 예산을 그대로 써요.
+- 들고 있기: 익절·손절·장마감 정리가 없어요. -10%·-20%·-30%와 기준 이탈 때 디스코드 알림만 가요. 파는 건 사용자가 키움 앱에서 직접 해요.
+- 켜져 있는 동안 급등주 단타·하락장 인버스·QQQ 장세 필터 진입은 쉬어요. SOXL·SOXS 단타와 서킷브레이커(신규 매수 차단)는 그대로예요.
+
+| 하고 싶은 것 | 명령 (서버) |
+|---|---|
+| 켜졌는지 확인 | `cd quant_system && grep -c '^VALUE_HOLD=on' config/.env` (1이면 켜짐) |
+| 오늘 고른 종목 | `cd quant_system && head -c 1500 data/value_hold/screen.json` |
+| 오늘 로그 | `journalctl -u quant-scheduler --since today -o cat \| grep -E '우량·가치\|분기: value'` |
+
+> ⚠️ **들고 있는 동안 끄지 마세요.** 끄면 가치 보유 종목에 일반 기준(손절 -1.8%, 익절, 장마감 정리)이 바로 붙어 그날 팔릴 수 있어요. 끄기 전에 사용자와 팔지·계속 들지를 먼저 정해요.
 
 ## 8. 노트북(두 번째 PC)에서 작업하기
 
