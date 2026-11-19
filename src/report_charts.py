@@ -241,7 +241,9 @@ def send_daily_chart(day, trades: pd.DataFrame, market: list, webhook_url: str |
         send_discord_image(path, f"📊 일일 리뷰 그래프 ({day.isoformat()})", webhook_url)
         return path
     except Exception as e:
-        print(f"⚠️ 일일 리뷰 그래프 생성/전송 실패: {e}")
+        # 전송 예외 문구에는 웹훅 주소(토큰)가 들어갈 수 있어 종류만 남긴다. 그래프 생성 오류는 내용을 남긴다
+        detail = type(e).__name__ if isinstance(e, requests.exceptions.RequestException) else e
+        print(f"⚠️ 일일 리뷰 그래프 생성/전송 실패: {detail}")
         return None
 
 

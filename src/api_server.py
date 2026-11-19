@@ -158,7 +158,7 @@ def send_discord(content: str):
     try:
         requests.post(DISCORD_WEBHOOK, json={"content": content}, timeout=5)
     except Exception as e:
-        print(f"⚠️ 디스코드 오류: {e}")
+        print(f"⚠️ 디스코드 오류: {type(e).__name__}")  # 예외 문구에 웹훅 주소(토큰)가 들어갈 수 있음
 
 def submit_us_stock_order(
     ticker: str, order_type: str, qty: int, price: float, exchange: str | None = None

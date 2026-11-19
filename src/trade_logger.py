@@ -366,6 +366,6 @@ def finalize_daily_summary(
         try:
             discord_sender(f"```text\n{report_text}\n```")
         except Exception as e:
-            print(f"⚠️ 결산 리포트 디스코드 전송 실패: {e}")
+            print(f"⚠️ 결산 리포트 디스코드 전송 실패: {type(e).__name__}")  # 웹훅 주소가 로그에 남지 않게
 
     return daily_row

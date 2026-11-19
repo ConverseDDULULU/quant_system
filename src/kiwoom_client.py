@@ -1014,7 +1014,7 @@ class KiwoomClient:
         try:
             requests.post(webhook, json={"content": content}, timeout=5)
         except Exception as e:
-            print(f"⚠️ 주문 거부 알림 전송 실패: {e}")
+            print(f"⚠️ 주문 거부 알림 전송 실패: {type(e).__name__}")  # 예외 문구에 웹훅 주소(토큰)가 들어갈 수 있음
 
 
 if __name__ == "__main__":
