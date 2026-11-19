@@ -199,8 +199,9 @@ def process_bars(state: dict, base: pd.DataFrame, etfs: dict[str, pd.DataFrame],
             direction = signal_direction(base, i)
             ticker = LONG if direction > 0 else INVERSE
             if direction and rule.get("news_filter"):
-                if soxl_news.blocks(ticker, soxl_news.latest_at(ts + BAR + BAR_SETTLE, rule.get("news_path"))):
-                    continue  # 실거래처럼 막힌 신호는 진입 횟수·종목에 세지 않는다
+                verdict = soxl_news.latest_at(ts + BAR + BAR_SETTLE, rule.get("news_path"))
+                if verdict is None or soxl_news.blocks(ticker, verdict):
+                    continue  # 실거래처럼 판단이 없을 때도 진입 안 함 (2026-11-18)  # 실거래처럼 막힌 신호는 진입 횟수·종목에 세지 않는다
             if direction and not (rule["one_per_ticker"] and ticker in state["tickers_today"]):
                 state["pending"] = ticker
                 state["entries_today"] += 1

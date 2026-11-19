@@ -781,6 +781,9 @@ def _try_soxl_entry(client, held_tickers, usd_available, dry_run) -> tuple[str, 
     if not soxl_live.is_enabled():
         return None
     try:
+        halted = soxl_live.halted_today()
+        if halted:
+            return None  # 오늘 키움이 매수를 거부해 SOXL·SOXS 진입을 멈춤 (거부 때 한 번 로그·알림)
         if any(t in held_tickers for t in soxl_live.TICKERS):
             return None  # 한 번에 하나만 (대기 매수 포함)
         done_today = [t for t in soxl_live.TICKERS if has_ticker_activity_today(t)]
@@ -824,6 +827,10 @@ def _try_soxl_entry(client, held_tickers, usd_available, dry_run) -> tuple[str, 
         )
         if str(return_code) != "0":
             finish_ticker_buy(ticker, accepted=False)
+            reason = f"[{return_code}] {res.get('return_msg', '응답 없음')}"
+            soxl_live.halt_today(reason)
+            print(f"   ⏸️ [SOXL 단타] 키움 매수 거부 → 오늘 SOXL·SOXS 진입 멈춤: {reason}")
+            send_discord_message(f"⏸️ **[SOXL 단타 오늘 멈춤]** {ticker} 매수 거부: {reason}\n- 내일 장에 다시 시도해요")
             return None
         finish_ticker_buy(ticker, accepted=True)
         TODAY_BOUGHT.append(ticker)

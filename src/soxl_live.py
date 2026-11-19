@@ -14,7 +14,7 @@
     SOXL·SOXS를 들고 있거나 대기 매수 중이면 그 매입 금액은 이미 쓴 것으로 보고 나머지만 남겨 둔다
   · 1주 가격이 예약 금액보다 비싸면 사지 않는다. 진입 단가 $50 상한·최소 주문 금액은 적용하지 않는다
 뉴스 1차 필터(soxl_news, 사용자 요청 2026-11-15): 악재면 SOXL, 호재면 SOXS 신호를 진입하지 않는다.
-  SOXL_NEWS_FILTER=on(기본)/log/off. 뉴스 판단이 없거나 45분보다 오래됐으면 기술 신호대로 (막지 않음)
+  SOXL_NEWS_FILTER=on(기본)/log/off. on이면 뉴스 판단이 없거나 45분보다 오래됐을 때도 진입하지 않는다 (2026-11-18)
 스위치가 꺼져 있으면 이 모듈은 아무것도 하지 않고, SOXL을 들고 있더라도 엔진의 일반 기준으로 관리된다.
 """
 
@@ -39,6 +39,19 @@ DEFAULT_RESERVE_USD = 100.0  # 사용자 결정 2026-11-16: $300 중 $100은 SOX
 BUY_LIMIT_PREMIUM = 1.002  # 지정가 매수를 현재가보다 0.2% 위에 내 체결되게 (실제 체결은 매도호가)
 
 _last_checked_bar = None  # 이미 판단한 SOXX 5분봉 (같은 봉으로 두 번 진입하지 않게)
+_halted = None  # (뉴욕 날짜, 이유): 키움이 매수를 거부하면 그날 SOXL·SOXS 진입을 멈춘다
+
+
+def halt_today(reason: str, now=None) -> None:
+    """11/18 키움 거부(509251 투자자정보확인서 미등록)에도 신호마다 다시 주문해 하루 6번 거부됐다"""
+    global _halted
+    _halted = ((now or now_ny()).date(), reason)
+
+
+def halted_today(now=None) -> str | None:
+    if _halted and _halted[0] == (now or now_ny()).date():
+        return _halted[1]
+    return None
 
 
 def is_enabled() -> bool:
@@ -133,6 +146,10 @@ def check_signal(now=None, frame_fn=_soxx_frame, news_fn=soxl_news.latest_at) ->
             print(f"⚠️ [SOXL 실거래] 뉴스 판단 읽기 실패: {type(e).__name__}: {e}")
             verdict = None
         reason += f" | {soxl_news.describe(verdict)}"
+        if verdict is None and news_mode == "on":
+            # 2026-11-18: Gemini 503·뉴스 수집 장애로 판단이 없을 때도 진입해 필터가 빠졌다. 1차 필터를 못 하면 사지 않는다
+            print(f"📰 [SOXL 뉴스 필터] {ticker} 기술 신호, 뉴스 판단 없음 → 진입 안 함: {reason}")
+            return None
         if soxl_news.blocks(ticker, verdict):
             tag = "진입 안 함" if news_mode == "on" else "기록만, 진입은 함 (SOXL_NEWS_FILTER=log)"
             print(f"📰 [SOXL 뉴스 필터] {ticker} 기술 신호를 뉴스가 막음: {reason} → {tag}")
