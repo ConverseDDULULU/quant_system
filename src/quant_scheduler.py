@@ -13,6 +13,7 @@ import bear_mode
 import pending_orders
 import sector_guard
 import soxl_live
+import value_hold
 import daily_review
 import strategy_params
 import trading_safety
@@ -380,8 +381,10 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
     holdings = balance_res.get("result_list", [])
 
     if closing:
-        if holdings:
-            liquidate_all_positions(client, holdings, pending_sells)
+        # 우량·가치 보유(VALUE_HOLD=on)는 장마감에 정리하지 않는다 (사용자 결정 2026-11-19)
+        closing_positions = [h for h in holdings if not value_hold.manages(h.get("stk_cd") or h.get("symbol") or "")]
+        if closing_positions:
+            liquidate_all_positions(client, closing_positions, pending_sells)
             print(
                 "💤 장마감 청산 주문 처리를 마쳤습니다. 실제 체결은 계좌 잔고에서 확인하세요."
             )
@@ -450,6 +453,16 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
 
             if ticker in pending_sells:
                 print(f"   ⏳ [매도 대기 중] {ticker}: 체결을 기다리며 매도 주문을 다시 내지 않음")
+                continue
+
+            if value_hold.manages(ticker):
+                # 우량·가치 보유: 익절·손절 없이 들고 간다. 크게 빠지거나 기준에서 빠지면 알림만 (사용자 결정 2026-11-19)
+                try:
+                    for message in value_hold.holding_alerts(ticker, profit_rate, value_hold.in_screen(ticker)):
+                        send_discord_message(message)
+                except Exception as e:
+                    print(f"⚠️ [우량·가치 보유] {ticker} 알림 처리 오류: {type(e).__name__}: {e}")
+                print(f"   🏦 [우량·가치 보유] {ticker}: 자동 매도 없음 | 분기: {value_hold.BRANCH}")
                 continue
 
             is_sell_triggered = False
@@ -545,6 +558,8 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
     if LAST_SCAN_AT is not None and time.monotonic() - LAST_SCAN_AT < SCAN_INTERVAL_SECONDS:
         return
     LAST_SCAN_AT = time.monotonic()
+    if value_hold.is_enabled():
+        value_hold.refresh_screen_async()  # 하루 한 번 우량·가치 고르기 (뒤에서 돌아 보유 점검을 막지 않음)
 
     breaker = get_circuit_breaker_status(usd_available)
     if breaker["newly_blocked"]:
@@ -600,6 +615,11 @@ def run_trading_cycle(client: KiwoomClient, dry_run: bool = False):
             f"💵 [SOXL 예약 ${soxl_reserve:.0f}] 일반 매매 기준 금액 ${regular_equity:.2f}, 쓸 수 있는 현금 ${regular_cash:.2f} "
             f"(SOXL·SOXS에 들어간 돈 ${soxl_committed:.2f})"
         )
+
+    if value_hold.is_enabled():
+        # 급등주 단타·하락장 인버스·QQQ 장세 필터 대신 우량·가치 보유 매수만 (사용자 결정 2026-11-19)
+        _try_value_entry(client, held_tickers, regular_held, regular_equity, regular_cash, MAX_HOLDINGS, dry_run)
+        return
 
     # 하락장 대응: 하락 추세 + 악재 확인 시 일반 매수 대신 1배 인버스 ETF 진입 (bear_mode.py)
     if bear_mode.is_enabled():
@@ -844,6 +864,83 @@ def _try_soxl_entry(client, held_tickers, usd_available, dry_run) -> tuple[str, 
     except Exception as e:
         print(f"⚠️ [SOXL 단타] 진입 처리 오류: {type(e).__name__}: {e} (일반 매수는 계속)")
         return None
+
+
+VALUE_QUOTES_PER_SCAN = 6  # 한 스캔에서 키움 현재가를 볼 우량·가치 후보 수 (점수 높은 순)
+
+
+def _try_value_entry(client, held_tickers, regular_held, equity, cash, max_holdings, dry_run) -> str | None:
+    """우량·가치 보유 매수: 하루 1종목, 점수 높은 순으로 20일 평균 이하로 눌린 종목. 산 종목을 돌려준다"""
+    now = now_ny()
+    if not value_hold.in_entry_window(now):
+        return None
+    state = value_hold.load_state()
+    if len(value_hold.buys_today(state, now)) >= value_hold.MAX_BUYS_PER_DAY:
+        return None
+    if len(regular_held) >= max_holdings:
+        print(f"🔒 [우량·가치] 보유 칸 만석 ({len(regular_held)}/{max_holdings}), 신규 매수 안 함")
+        return None
+    screen = value_hold.load_screen()
+    if screen.get("date") != now.date().isoformat():
+        print("⏳ [우량·가치] 오늘 고르기 결과를 기다리는 중")
+        return None
+    budget = position_budget_usd(equity, cash)
+    quoted = 0
+    for cand in screen.get("candidates", []):
+        ticker = cand["ticker"]
+        if ticker in held_tickers or ticker in TODAY_BOUGHT or has_ticker_activity_today(ticker):
+            continue
+        if not cand.get("sma") or cand.get("price", 0) > budget:
+            continue  # 1주도 못 사는 비싼 종목 (고르기 때 가격 기준)
+        if quoted >= VALUE_QUOTES_PER_SCAN:
+            break
+        same = sector_guard.find_same_industry(ticker, set(regular_held) | set(TODAY_BOUGHT))
+        if same:
+            continue
+        exchange = get_exchange_code(client, ticker)
+        if exchange not in BUY_EXCHANGES:
+            continue
+        quoted += 1
+        try:
+            data = client.get_us_stock_quote(ticker, exchange) or {}
+            price = abs(float(str(data.get("cur_prc", "0")).replace(",", "").replace("+", "") or 0))
+        except (TypeError, ValueError, AttributeError):
+            price = 0.0
+        if price <= 0:
+            continue
+        if price > cand["sma"]:
+            continue  # 20일 평균보다 비싸면 눌릴 때까지 기다림
+        limit_price = format_us_price(price * value_hold.BUY_LIMIT_PREMIUM)
+        qty = max_position_qty(limit_price, equity, cash, PARAMS["max_buy_qty"])
+        if qty <= 0 or qty * limit_price < PARAMS["min_order_usd"]:
+            continue
+        reason = (
+            f"우량·가치 점수 {cand.get('rank', '?')}위 | PER {cand['trailing_pe']} (선행 {cand['forward_pe']}) | ROE {cand['roe'] * 100:.0f}% | "
+            f"영업이익률 {cand['operating_margin'] * 100:.0f}% | 부채비율 {cand['debt_to_equity']:.0f}% | "
+            f"현재가 ${price:.2f} ≤ 20일 평균 ${cand['sma']:.2f}"
+        )
+        print(f"🏦 [우량·가치 매수 후보] {ticker} {qty}주 @ ${limit_price:.2f} | {reason} | 분기: {value_hold.BRANCH}")
+        if dry_run:
+            return None
+        if not reserve_ticker_buy(ticker):
+            continue
+        res = client.order_us_stock(ticker=ticker, order_type="BUY", qty=qty, price=limit_price, exchange=exchange) or {}
+        return_code = res.get("return_code", -1)
+        print(f"  ➔ 키움 실계좌 매수 접수 응답 ({exchange}): [{return_code}] {res.get('return_msg', '응답 없음')} | 분기: {value_hold.BRANCH}")
+        if str(return_code) != "0":
+            finish_ticker_buy(ticker, accepted=False)
+            return None  # 거부면 이번 스캔은 그만 (다음 스캔에 다른 종목)
+        finish_ticker_buy(ticker, accepted=True)
+        TODAY_BOUGHT.append(ticker)
+        value_hold.record_buy(ticker, qty, limit_price, now)
+        send_discord_message(
+            f"🏦 **[우량·가치 매수 접수]** {ticker} {qty}주 @ ${limit_price:.2f} ({cand.get('name', '')})\n"
+            f"- 진입 분기: 우량·가치 보유 ({value_hold.BRANCH})\n"
+            f"- 근거: {reason}\n"
+            f"- 익절·손절 없이 들고 가요. -10%·-20%·-30%와 기준에서 빠질 때 알려 드려요"
+        )
+        return ticker
+    return None
 
 
 def try_inverse_entry(client, held_tickers, regular_held, equity, usd_available, max_holdings, bear_reason, dry_run):
